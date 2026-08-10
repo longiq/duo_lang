@@ -4,6 +4,19 @@ Web Speech API (STT/TTS) và Service Worker **bắt buộc HTTPS** (trừ localh
 
 Nếu chưa có domain riêng, dùng domain miễn phí trỏ thẳng theo IP: `https://<IP-cua-ban-thay-dau-cham-bang-gach-ngang>.sslip.io` (ví dụ IP `123.45.67.89` → domain `123-45-67-89.sslip.io`), không cần đăng ký gì cả, Let's Encrypt cấp cert bình thường cho domain này.
 
+## Cách nhanh: dùng script tự động
+
+Toàn bộ các bước dưới đã được gói vào `deploy/bootstrap.sh` (idempotent, chạy lại nhiều lần an toàn, không ghi đè `.env` đã có):
+
+```bash
+scp deploy/bootstrap.sh <host>:/tmp/
+ssh <host> 'sudo bash /tmp/bootstrap.sh your-domain.example.com'
+```
+
+Script tự lo swap, cài Node/nginx/certbot, mở firewall, clone code, systemd, nginx, và xin cert — bỏ qua bước cert nếu DNS chưa trỏ về đúng IP (chạy lại sau khi DNS xong).
+
+Các phần dưới là bản thủ công, giải thích từng bước script làm gì. Deploy cho máy `vpn-proxy-sg` xem thêm [`vpn-proxy-sg.md`](vpn-proxy-sg.md).
+
 ## 1. Mở port 80/443
 
 Oracle Cloud có **2 lớp firewall**, phải mở cả hai:
@@ -89,7 +102,19 @@ Mở `https://YOUR_DOMAIN` trên điện thoại (Chrome/Safari) → thử nói 
 
 ```bash
 cd /opt/duolang
-sudo git pull
+sudo git fetch origin
+sudo git reset --hard origin/main   # đây là bản checkout để deploy, không có commit local
 sudo npm install --omit=dev
+sudo chown -R duolang:duolang /opt/duolang
+sudo chown root:duolang /opt/duolang/.env
 sudo systemctl restart duolang
 ```
+
+`.env` và `node_modules` nằm trong `.gitignore` nên `reset --hard` không xoá chúng. Hoặc chỉ cần chạy lại `bootstrap.sh` — nó làm đúng các bước trên.
+
+## Máy đang chạy
+
+| Máy | IP | Domain | Trạng thái |
+|---|---|---|---|
+| `dev-sg` | 140.245.108.249 | `duolang.longiq.xyz` | Đã deploy, chờ DNS + API key |
+| `vpn-proxy-sg` (`oracle-vpn`) | 161.118.195.13 | chưa đặt | Offline — kế hoạch ở [`vpn-proxy-sg.md`](vpn-proxy-sg.md) |
