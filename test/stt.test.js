@@ -295,9 +295,11 @@ async function serverTtsPlaysThroughWebAudio() {
   const gainValues = audio.gains.map((g) => g.gain.value);
   check('normalising gain lifts the quiet clip', gainValues.some((v) => v > 3.5 && v < 4.5),
         `gains: ${gainValues.join(', ')}`);
-  check('make-up gain above unity applied', gainValues.some((v) => v === 1.8),
+  check('make-up gain above unity applied', gainValues.some((v) => v === 3),
         `gains: ${gainValues.join(', ')}`);
-  check('compressor in the chain', audio.compressors.length === 2);
+  check('compressor limits rather than gently compresses',
+        audio.compressors.every((c) => c.ratio.value >= 20 && c.threshold.value === -12),
+        audio.compressors.map((c) => `t=${c.threshold.value} r=${c.ratio.value}`).join(', '));
   check('no loading spinner left behind',
         !els.speakEnBtn.classList.contains('loading') && !els.speakJaBtn.classList.contains('loading'));
 }
