@@ -1,14 +1,48 @@
+const LANGS = {
+  vi: {
+    label: '🇻🇳 Tiếng Việt',
+    bcp47: 'vi-VN',
+    prompt: 'Bấm micro và nói tiếng Việt',
+    sourcePlaceholder: 'Câu bạn nói sẽ hiện ở đây, sửa được...',
+    targetPlaceholder: 'Bản dịch tiếng Việt sẽ hiện ở đây...',
+  },
+  en: {
+    label: '🇬🇧 English',
+    bcp47: 'en-US',
+    prompt: 'Bấm micro và nói tiếng Anh',
+    sourcePlaceholder: 'Your sentence appears here, editable...',
+    targetPlaceholder: 'Bản dịch tiếng Anh sẽ hiện ở đây...',
+  },
+  ja: {
+    label: '🇯🇵 日本語',
+    bcp47: 'ja-JP',
+    prompt: 'Bấm micro và nói tiếng Nhật',
+    sourcePlaceholder: '話した文がここに表示されます...',
+    targetPlaceholder: '日本語の翻訳がここに表示されます...',
+  },
+};
+// Fixed order so the two target panes never swap position unexpectedly.
+const LANG_ORDER = ['vi', 'en', 'ja'];
+const SOURCE_STORAGE_KEY = 'duolang.sourceLang';
+
 const micBtn = document.getElementById('micBtn');
 const micStatus = document.getElementById('micStatus');
-const vietnameseText = document.getElementById('vietnameseText');
-const englishText = document.getElementById('englishText');
-const japaneseText = document.getElementById('japaneseText');
-const speakEnBtn = document.getElementById('speakEnBtn');
-const speakJaBtn = document.getElementById('speakJaBtn');
+const subtitle = document.getElementById('subtitle');
+const langSwitch = document.getElementById('langSwitch');
+const sourceInput = document.getElementById('sourceText');
+const retranslateBtn = document.getElementById('retranslateBtn');
 const errorMsg = document.getElementById('errorMsg');
+const targetPanes = [0, 1].map((i) => ({
+  label: document.getElementById(`targetLabel${i}`),
+  text: document.getElementById(`targetText${i}`),
+  speak: document.getElementById(`speakBtn${i}`),
+  lang: null,
+}));
 
-let currentEn = '';
-let currentJa = '';
+let sourceLang = 'vi';
+let targetLangs = ['en', 'ja'];
+let translations = {};
+let lastTranslatedText = '';
 
 function showError(message) {
   errorMsg.textContent = message;
@@ -24,30 +58,106 @@ function setText(el, text, isPlaceholder) {
   el.classList.toggle('placeholder', Boolean(isPlaceholder));
 }
 
+function idlePrompt() {
+  return LANGS[sourceLang].prompt;
+}
+
+function autoGrow() {
+  sourceInput.style.height = 'auto';
+  sourceInput.style.height = `${sourceInput.scrollHeight}px`;
+}
+
+function targetsFor(source) {
+  return LANG_ORDER.filter((l) => l !== source);
+}
+
+function clearTranslations() {
+  translations = {};
+  lastTranslatedText = '';
+  targetPanes.forEach((pane) => {
+    setText(pane.text, LANGS[pane.lang].targetPlaceholder, true);
+    pane.speak.disabled = true;
+  });
+}
+
+function refreshRetranslateState() {
+  const text = sourceInput.value.trim();
+  retranslateBtn.disabled = !text || text === lastTranslatedText;
+}
+
+function applySourceLang(lang, { keepText = false } = {}) {
+  sourceLang = lang;
+  targetLangs = targetsFor(lang);
+
+  langSwitch.querySelectorAll('.lang-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.lang === lang);
+  });
+
+  targetPanes.forEach((pane, i) => {
+    pane.lang = targetLangs[i];
+    pane.label.textContent = LANGS[pane.lang].label;
+    pane.speak.setAttribute('aria-label', `Nghe ${LANGS[pane.lang].label}`);
+  });
+
+  sourceInput.placeholder = LANGS[lang].sourcePlaceholder;
+  subtitle.textContent = `Nói ${LANGS[lang].label.replace(/^\S+\s/, '')} → dịch cùng lúc sang 2 ngôn ngữ còn lại`;
+  micStatus.textContent = idlePrompt();
+
+  if (!keepText) sourceInput.value = '';
+  clearTranslations();
+  refreshRetranslateState();
+  autoGrow();
+
+  try { localStorage.setItem(SOURCE_STORAGE_KEY, lang); } catch (err) { /* private mode */ }
+}
+
 async function translate(text) {
   micStatus.textContent = 'Đang dịch...';
+  clearError();
   try {
     const res = await fetch('/api/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ text, source: sourceLang, targets: targetLangs }),
     });
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.error || 'Lỗi dịch thuật.');
     }
-    currentEn = data.en;
-    currentJa = data.ja;
-    setText(englishText, data.en, false);
-    setText(japaneseText, data.ja, false);
-    speakEnBtn.disabled = false;
-    speakJaBtn.disabled = false;
-    micStatus.textContent = 'Bấm micro và nói tiếng Việt';
+
+    const result = data.translations || data;
+    translations = {};
+    targetPanes.forEach((pane) => {
+      const value = result[pane.lang];
+      translations[pane.lang] = value;
+      setText(pane.text, value, false);
+      pane.speak.disabled = !value;
+    });
+    lastTranslatedText = text;
+    micStatus.textContent = idlePrompt();
   } catch (err) {
     showError(err.message || 'Không thể dịch câu này.');
-    micStatus.textContent = 'Bấm micro và nói tiếng Việt';
+    micStatus.textContent = idlePrompt();
+  } finally {
+    refreshRetranslateState();
   }
 }
+
+langSwitch.addEventListener('click', (event) => {
+  const btn = event.target.closest('.lang-btn');
+  if (!btn || btn.dataset.lang === sourceLang) return;
+  applySourceLang(btn.dataset.lang);
+});
+
+sourceInput.addEventListener('input', () => {
+  autoGrow();
+  refreshRetranslateState();
+});
+
+retranslateBtn.addEventListener('click', () => {
+  const text = sourceInput.value.trim();
+  if (text) translate(text);
+});
 
 const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
 let voices = [];
@@ -205,7 +315,12 @@ async function speakViaServer(ctx, text, lang) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, lang }),
     });
-    if (!res.ok) throw new Error('speech request failed');
+    if (!res.ok) {
+      const err = new Error('speech request failed');
+      // Distinguish the daily cap so the user is told why it sounds different.
+      err.quotaExhausted = res.status === 429;
+      throw err;
+    }
     buffer = await decodeAudio(ctx, await res.arrayBuffer());
     audioCache.set(key, buffer);
   }
@@ -222,16 +337,22 @@ async function speak(text, lang, button) {
     if (!ctx) throw new Error('Web Audio unavailable');
     await speakViaServer(ctx, text, lang);
   } catch (err) {
-    // Offline, or the speech service is unhappy: the device voice is quieter
-    // but better than silence.
-    speakWithDeviceVoice(text, lang === 'ja' ? 'ja-JP' : 'en-US');
+    // Offline, out of daily quota, or the service is unhappy: the device voice
+    // is quieter but better than silence.
+    if (err && err.quotaExhausted) {
+      showError('Hết quota giọng đọc chất lượng cao hôm nay, đang dùng giọng máy.');
+    }
+    speakWithDeviceVoice(text, LANGS[lang].bcp47);
   } finally {
     button.classList.remove('loading');
   }
 }
 
-speakEnBtn.addEventListener('click', () => speak(currentEn, 'en', speakEnBtn));
-speakJaBtn.addEventListener('click', () => speak(currentJa, 'ja', speakJaBtn));
+targetPanes.forEach((pane) => {
+  pane.speak.addEventListener('click', () => {
+    speak(translations[pane.lang], pane.lang, pane.speak);
+  });
+});
 
 const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -240,7 +361,6 @@ if (!SpeechRecognitionImpl) {
   showError('Trình duyệt này không hỗ trợ nhận diện giọng nói. Hãy dùng Chrome trên Android/desktop.');
 } else {
   const recognition = new SpeechRecognitionImpl();
-  recognition.lang = 'vi-VN';
   recognition.interimResults = true;
   recognition.maxAlternatives = 1;
 
@@ -269,7 +389,7 @@ if (!SpeechRecognitionImpl) {
       translationStarted = true;
       translate(lastTranscript);
     } else if (!translationStarted && !sessionFailed) {
-      micStatus.textContent = 'Bấm micro và nói tiếng Việt';
+      micStatus.textContent = idlePrompt();
     }
   });
 
@@ -282,7 +402,7 @@ if (!SpeechRecognitionImpl) {
     } else if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
       showError('Cần cấp quyền micro cho trang này.');
     } else if (event.error === 'aborted') {
-      micStatus.textContent = 'Bấm micro và nói tiếng Việt';
+      micStatus.textContent = idlePrompt();
     } else {
       showError('Lỗi nhận diện giọng nói: ' + event.error);
     }
@@ -304,7 +424,9 @@ if (!SpeechRecognitionImpl) {
     if (!text) return;
 
     lastTranscript = text;
-    setText(vietnameseText, text, false);
+    sourceInput.value = text;
+    autoGrow();
+    refreshRetranslateState();
     if (finalTranscript) {
       translationStarted = true;
       translate(text);
@@ -316,11 +438,11 @@ if (!SpeechRecognitionImpl) {
       recognition.stop();
       return;
     }
-    speakEnBtn.disabled = true;
-    speakJaBtn.disabled = true;
-    setText(englishText, 'Bản dịch tiếng Anh sẽ hiện ở đây...', true);
-    setText(japaneseText, '日本語の翻訳がここに表示されます...', true);
+    clearTranslations();
+    refreshRetranslateState();
     clearError();
+    // Set per start: the user can switch source language between recordings.
+    recognition.lang = LANGS[sourceLang].bcp47;
     try {
       recognition.start();
     } catch (err) {
@@ -328,6 +450,11 @@ if (!SpeechRecognitionImpl) {
     }
   });
 }
+
+// Restore the last source language before anything else reads the state.
+let storedLang = null;
+try { storedLang = localStorage.getItem(SOURCE_STORAGE_KEY); } catch (err) { /* private mode */ }
+applySourceLang(LANGS[storedLang] ? storedLang : 'vi');
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {

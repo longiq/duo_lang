@@ -21,7 +21,7 @@
   <main class="app">
     <header class="app-header">
       <h1>DuoLang</h1>
-      <p class="subtitle">Nói tiếng Việt &rarr; dịch cùng lúc sang Anh &amp; Nhật</p>
+      <p class="subtitle" id="subtitle">Nói tiếng Việt &rarr; dịch cùng lúc sang Anh &amp; Nhật</p>
     </header>
 
     <section class="mic-section">
@@ -34,29 +34,39 @@
       <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
     </section>
 
-    <section class="card">
-      <div class="card-label">🇻🇳 Tiếng Việt</div>
-      <p id="vietnameseText" class="text-content placeholder">Câu bạn nói sẽ hiện ở đây...</p>
+    <section class="card source-card">
+      <div class="lang-switch" id="langSwitch" role="group" aria-label="Ngôn ngữ nói">
+        <button type="button" class="lang-btn" data-lang="vi">🇻🇳 Việt</button>
+        <button type="button" class="lang-btn" data-lang="en">🇬🇧 English</button>
+        <button type="button" class="lang-btn" data-lang="ja">🇯🇵 日本語</button>
+      </div>
+      <textarea id="sourceText" class="text-content source-input" rows="2"
+                autocomplete="off" autocapitalize="sentences" spellcheck="false"
+                aria-label="Câu nguồn, có thể sửa"></textarea>
+      <div class="source-actions">
+        <span class="source-hint" id="sourceHint">Sửa được nếu nhận diện sai</span>
+        <button type="button" id="retranslateBtn" class="retranslate-btn" disabled>Dịch lại</button>
+      </div>
     </section>
 
-    <section class="card">
+    <section class="card" id="targetCard0">
       <div class="card-label-row">
-        <div class="card-label">🇬🇧 English</div>
-        <button id="speakEnBtn" class="speak-btn" aria-label="Nghe tiếng Anh" disabled>
+        <div class="card-label" id="targetLabel0"></div>
+        <button class="speak-btn" id="speakBtn0" aria-label="Nghe bản dịch thứ nhất" disabled>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="englishText" class="text-content placeholder">Bản dịch tiếng Anh sẽ hiện ở đây...</p>
+      <p id="targetText0" class="text-content placeholder"></p>
     </section>
 
-    <section class="card">
+    <section class="card" id="targetCard1">
       <div class="card-label-row">
-        <div class="card-label">🇯🇵 日本語</div>
-        <button id="speakJaBtn" class="speak-btn" aria-label="Nghe tiếng Nhật" disabled>
+        <div class="card-label" id="targetLabel1"></div>
+        <button class="speak-btn" id="speakBtn1" aria-label="Nghe bản dịch thứ hai" disabled>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="japaneseText" class="text-content placeholder">日本語の翻訳がここに表示されます...</p>
+      <p id="targetText1" class="text-content placeholder"></p>
     </section>
 
     <p id="errorMsg" class="error-msg" hidden></p>

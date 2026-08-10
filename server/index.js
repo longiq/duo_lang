@@ -12,11 +12,18 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // us. Check https://ai.google.dev/gemini-api/docs/models when bumping: retired
 // models don't 404, they report a free-tier quota of 0.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
-// One voice per language so the two panes are audibly distinct. These are
-// Gemini's prebuilt voices; the model infers the language from the text itself.
-const TTS_VOICES = { en: 'Kore', ja: 'Aoede' };
+// Each TTS model carries its own free-tier allowance of only 10 requests per
+// day, so exhausting one falls through to the next rather than failing.
+const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
+  'gemini-2.5-flash-preview-tts,gemini-3.1-flash-tts-preview')
+  .split(',').map((m) => m.trim()).filter(Boolean);
+// One voice per language so the panes are audibly distinct. These are Gemini's
+// prebuilt voices; the model infers the language from the text itself.
+const TTS_VOICES = { vi: 'Puck', en: 'Kore', ja: 'Aoede' };
 const TTS_MAX_CHARS = 600;
+
+const LANG_NAMES = { vi: 'Vietnamese', en: 'English', ja: 'Japanese' };
+const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -26,16 +33,35 @@ app.post('/api/translate', async (req, res) => {
   if (!text) {
     return res.status(400).json({ error: 'Missing "text" field.' });
   }
+
+  // Defaults keep older cached clients, which only ever sent text, working.
+  const source = (req.body && req.body.source || 'vi').toLowerCase();
+  const targets = Array.isArray(req.body && req.body.targets) && req.body.targets.length
+    ? req.body.targets.map((t) => String(t).toLowerCase())
+    : SUPPORTED_LANGS.filter((l) => l !== source);
+
+  if (!LANG_NAMES[source]) {
+    return res.status(400).json({ error: `Unsupported source "${source}".` });
+  }
+  const badTarget = targets.find((t) => !LANG_NAMES[t]);
+  if (badTarget) {
+    return res.status(400).json({ error: `Unsupported target "${badTarget}".` });
+  }
+  if (targets.includes(source)) {
+    return res.status(400).json({ error: 'Source language cannot also be a target.' });
+  }
   if (!GEMINI_API_KEY) {
     return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
   }
 
-  const prompt = `You are a professional Vietnamese-English-Japanese translator.
-Translate the following Vietnamese sentence into natural, fluent English and natural, fluent Japanese.
-Keep the original meaning and tone. Do not add explanations.
-Respond ONLY with valid JSON in this exact shape: {"en": "...", "ja": "..."}
+  const targetList = targets.map((t) => LANG_NAMES[t]).join(' and ');
+  const shape = `{${targets.map((t) => `"${t}": "..."`).join(', ')}}`;
+  const prompt = `You are a professional translator.
+Translate the following ${LANG_NAMES[source]} sentence into natural, fluent ${targetList}.
+Keep the original meaning, tone and level of politeness. Do not add explanations.
+Respond ONLY with valid JSON in this exact shape: ${shape}
 
-Vietnamese sentence: "${text}"`;
+${LANG_NAMES[source]} sentence: "${text}"`;
 
   try {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -70,11 +96,17 @@ Vietnamese sentence: "${text}"`;
       return res.status(502).json({ error: 'Could not parse translation result.' });
     }
 
-    if (typeof parsed.en !== 'string' || typeof parsed.ja !== 'string') {
-      return res.status(502).json({ error: 'Malformed translation result.' });
+    const translations = {};
+    for (const target of targets) {
+      if (typeof parsed[target] !== 'string' || !parsed[target].trim()) {
+        return res.status(502).json({ error: 'Malformed translation result.' });
+      }
+      translations[target] = parsed[target].trim();
     }
 
-    res.json({ en: parsed.en, ja: parsed.ja });
+    // Spread as well as nest so a client cached before this change, which read
+    // data.en / data.ja directly, keeps working.
+    res.json({ source, translations, ...translations });
   } catch (err) {
     console.error('Translate request failed:', err);
     res.status(500).json({ error: 'Internal server error.' });
@@ -169,25 +201,53 @@ app.post('/api/tts', async (req, res) => {
   if (cached) return sendWav(cached, true);
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TTS_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text }] }],
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } },
-          },
-        },
-      }),
-    });
+    // Without an explicit instruction the model treats a greeting or a question
+    // as something to answer and returns text, failing with "Model tried to
+    // generate text". Phrasing it as a spoken instruction is the documented way
+    // to drive these models, and the prefix itself is not read aloud.
+    const prompt = `Read this text aloud exactly as written, in a natural voice: ${text}`;
 
-    if (!geminiRes.ok) {
-      const errBody = await geminiRes.text();
-      console.error('Gemini TTS error:', geminiRes.status, errBody);
-      return res.status(502).json({ error: 'Speech service error.' });
+    let geminiRes = null;
+    let lastStatus = 0;
+    let lastBody = '';
+
+    // Each model has its own daily allowance, so a 429 moves to the next one.
+    for (const model of GEMINI_TTS_MODELS) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const attempt = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } },
+            },
+          },
+        }),
+      });
+
+      if (attempt.ok) {
+        geminiRes = attempt;
+        break;
+      }
+
+      lastStatus = attempt.status;
+      lastBody = await attempt.text();
+      console.error(`Gemini TTS error (${model}):`, lastStatus, lastBody.slice(0, 400));
+      if (lastStatus !== 429) break; // only quota is worth retrying elsewhere
+    }
+
+    if (!geminiRes) {
+      // 429 is worth distinguishing: the client can say "quota exhausted"
+      // rather than a generic failure, and fall back to the device voice.
+      const status = lastStatus === 429 ? 429 : 502;
+      return res.status(status).json({
+        error: lastStatus === 429
+          ? 'Daily speech quota exhausted.'
+          : 'Speech service error.',
+      });
     }
 
     const data = await geminiRes.json();

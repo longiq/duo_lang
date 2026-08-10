@@ -124,6 +124,100 @@ body {
   font-size: 15px;
 }
 
+/* --- source card: language switch + editable text --- */
+
+.lang-switch {
+  display: flex;
+  gap: 4px;
+  background: #1b1d33;
+  border-radius: 10px;
+  padding: 3px;
+  margin-bottom: 12px;
+}
+
+.lang-btn {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: #a0a3c0;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  padding: 7px 4px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.lang-btn.active {
+  background: #6c5ce7;
+  color: #fff;
+}
+
+.source-input {
+  display: block;
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px dashed #3d3f66;
+  color: inherit;
+  font: inherit;
+  font-size: 17px;
+  line-height: 1.5;
+  padding: 0 0 8px;
+  resize: none;
+  overflow: hidden;
+  -webkit-appearance: none;
+  border-radius: 0;
+}
+
+.source-input:focus {
+  outline: none;
+  border-bottom-color: #6c5ce7;
+}
+
+.source-input::placeholder {
+  color: #6b6e8f;
+  font-style: italic;
+  font-size: 15px;
+}
+
+.source-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.source-hint {
+  font-size: 12px;
+  color: #6b6e8f;
+}
+
+.retranslate-btn {
+  border: 1px solid #4b4e7a;
+  background: #2b2d4d;
+  color: #f2f2f7;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.retranslate-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.retranslate-btn:not(:disabled):active {
+  transform: scale(0.96);
+}
+
 .speak-btn {
   width: 36px;
   height: 36px;

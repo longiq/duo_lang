@@ -1,9 +1,11 @@
-// Drives public/app.js against a stubbed DOM + SpeechRecognition.
+// Drives public/app.js against a stubbed DOM, SpeechRecognition and Web Audio.
 //
-// Regression guard for the mobile failure mode: recognition delivers only
-// interim results and then ends without ever marking one final. The Vietnamese
-// text appeared but nothing triggered a translation, and the status label stayed
-// frozen on "Đang nghe...".
+// Regression guards for failures that actually happened on a device:
+//  - recognition ends having only ever produced interim results, so nothing
+//    triggered a translation and the status label froze on "Đang nghe..."
+//  - iOS offers character voices (Grandpa, Fred) next to the real ones, and
+//    picking the first non-compact match landed on those
+//  - gentle compression measured at under +1 dB, i.e. no louder at all
 //
 // Run with: npm test
 const fs = require('fs');
@@ -12,31 +14,42 @@ const vm = require('vm');
 
 const APP_JS = path.join(__dirname, '..', 'public', 'app.js');
 
-function el(id) {
+function el(id, { classes = [], dataset = {}, children = [] } = {}) {
   const listeners = {};
-  const classes = new Set();
-  return {
+  const classSet = new Set(classes);
+  const node = {
     id,
+    dataset,
+    children,
     textContent: '',
+    value: '',
+    placeholder: '',
     disabled: false,
     hidden: false,
+    style: {},
+    scrollHeight: 40,
+    attributes: {},
     classList: {
-      add: (c) => classes.add(c),
-      remove: (c) => classes.delete(c),
-      toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)),
-      contains: (c) => classes.has(c),
+      add: (c) => classSet.add(c),
+      remove: (c) => classSet.delete(c),
+      toggle: (c, on) => (on ? classSet.add(c) : classSet.delete(c)),
+      contains: (c) => classSet.has(c),
     },
+    setAttribute: (k, v) => { node.attributes[k] = v; },
     addEventListener: (ev, fn) => { (listeners[ev] ||= []).push(fn); },
     _fire: (ev, arg) => (listeners[ev] || []).forEach((f) => f(arg)),
+    querySelectorAll: (sel) => (sel === '.lang-btn'
+      ? children.filter((c) => c.classList.contains('lang-btn'))
+      : []),
+    closest: (sel) => (sel === '.lang-btn' && classSet.has('lang-btn') ? node : null),
   };
+  return node;
 }
 
-// Minimal Web Audio stub that records the graph the app builds.
 function fakeAudioContext(record) {
   const node = (kind, extra = {}) => Object.assign({
     kind,
-    connectedTo: null,
-    connect(target) { this.connectedTo = target; return target; },
+    connect(target) { return target; },
   }, extra);
 
   return class FakeAudioContext {
@@ -49,11 +62,9 @@ function fakeAudioContext(record) {
     createBufferSource() {
       const source = node('source', {
         buffer: null,
-        started: false,
-        start() { this.started = true; record.started.push(this); },
+        start() { record.started.push(this); },
         stop() { this.stopped = true; },
       });
-      record.sources.push(source);
       return source;
     }
     createGain() {
@@ -69,9 +80,9 @@ function fakeAudioContext(record) {
       record.compressors.push(c);
       return c;
     }
-    decodeAudioData(bytes) {
-      record.decoded.push(bytes);
-      // Peak of 0.25 so the normalising gain has something to compute from.
+    decodeAudioData() {
+      record.decoded.push(true);
+      // Peak 0.25 so the normalising gain has something to compute from.
       return Promise.resolve({
         numberOfChannels: 1,
         getChannelData: () => new Float32Array([0, 0.25, -0.1]),
@@ -80,13 +91,41 @@ function fakeAudioContext(record) {
   };
 }
 
-function loadApp(overrideVoices, audioRecord) {
-  const ids = ['micBtn', 'micStatus', 'vietnameseText', 'englishText', 'japaneseText',
-               'speakEnBtn', 'speakJaBtn', 'errorMsg'];
-  const els = {};
-  ids.forEach((i) => { els[i] = el(i); });
+const DEFAULT_VOICES = [
+  { name: 'Grandpa', voiceURI: 'com.apple.voice.super-compact.en-US.Grandpa', lang: 'en-US' },
+  { name: 'Fred', voiceURI: 'com.apple.speech.synthesis.voice.Fred', lang: 'en-US' },
+  { name: 'Samantha (Compact)', voiceURI: 'com.apple.voice.compact.en-US.Samantha', lang: 'en-US', default: true },
+  { name: 'Samantha', voiceURI: 'com.apple.voice.enhanced.en-US.Samantha', lang: 'en-US' },
+  { name: 'Grandma', voiceURI: 'com.apple.voice.super-compact.ja-JP.Grandma', lang: 'ja-JP' },
+  { name: 'Kyoko (Compact)', voiceURI: 'com.apple.voice.compact.ja-JP.Kyoko', lang: 'ja-JP' },
+  { name: 'Hattori', voiceURI: 'com.apple.voice.premium.ja-JP.Hattori', lang: 'ja-JP' },
+  { name: 'Linh', voiceURI: 'com.apple.voice.enhanced.vi-VN.Linh', lang: 'vi-VN' },
+];
+
+function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, ttsStatus = 200 } = {}) {
+  const langButtons = ['vi', 'en', 'ja'].map((lang) =>
+    el(`lang-${lang}`, { classes: ['lang-btn'], dataset: { lang } }));
+
+  const els = {
+    micBtn: el('micBtn'),
+    micStatus: el('micStatus'),
+    subtitle: el('subtitle'),
+    langSwitch: el('langSwitch', { children: langButtons }),
+    sourceText: el('sourceText'),
+    retranslateBtn: el('retranslateBtn'),
+    errorMsg: el('errorMsg'),
+    targetLabel0: el('targetLabel0'),
+    targetLabel1: el('targetLabel1'),
+    targetText0: el('targetText0'),
+    targetText1: el('targetText1'),
+    speakBtn0: el('speakBtn0'),
+    speakBtn1: el('speakBtn1'),
+  };
 
   const fetchCalls = [];
+  const spoken = [];
+  const stored = new Map();
+  if (storedLang) stored.set('duolang.sourceLang', storedLang);
   const state = { recognition: null };
 
   class FakeRecognition {
@@ -101,18 +140,7 @@ function loadApp(overrideVoices, audioRecord) {
     stop() { this.started = false; this.fire('end'); }
   }
 
-  const spoken = [];
-  // Mirrors what iOS 17 actually offers: character voices and legacy novelty
-  // voices sit in the same list as the real ones, and Grandpa comes first.
-  const availableVoices = overrideVoices || [
-    { name: 'Grandpa', voiceURI: 'com.apple.voice.super-compact.en-US.Grandpa', lang: 'en-US' },
-    { name: 'Fred', voiceURI: 'com.apple.speech.synthesis.voice.Fred', lang: 'en-US' },
-    { name: 'Samantha (Compact)', voiceURI: 'com.apple.voice.compact.en-US.Samantha', lang: 'en-US', default: true },
-    { name: 'Samantha', voiceURI: 'com.apple.voice.enhanced.en-US.Samantha', lang: 'en-US' },
-    { name: 'Grandma', voiceURI: 'com.apple.voice.super-compact.ja-JP.Grandma', lang: 'ja-JP' },
-    { name: 'Kyoko (Compact)', voiceURI: 'com.apple.voice.compact.ja-JP.Kyoko', lang: 'ja-JP' },
-    { name: 'Hattori', voiceURI: 'com.apple.voice.premium.ja-JP.Hattori', lang: 'ja-JP' },
-  ];
+  const translationsByLang = { vi: 'Xin chào', en: 'Hello there', ja: 'こんにちは' };
 
   const sandbox = {
     document: { getElementById: (id) => els[id] || el(id) },
@@ -121,52 +149,58 @@ function loadApp(overrideVoices, audioRecord) {
       speechSynthesis: {
         cancel() {},
         speak(u) { spoken.push(u); },
-        getVoices: () => availableVoices,
+        getVoices: () => voices,
         addEventListener() {},
       },
       addEventListener() {},
     },
+    localStorage: {
+      getItem: (k) => (stored.has(k) ? stored.get(k) : null),
+      setItem: (k, v) => stored.set(k, v),
+    },
     navigator: {},
     SpeechSynthesisUtterance: class { constructor(t) { this.text = t; } },
     fetch: (url, opts) => {
-      fetchCalls.push({ url, body: opts && opts.body });
+      const body = opts && opts.body ? JSON.parse(opts.body) : {};
+      fetchCalls.push({ url, body });
       if (url === '/api/tts') {
-        return Promise.resolve({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
+        if (ttsStatus !== 200) {
+          return Promise.resolve({ ok: false, status: ttsStatus, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({ ok: true, status: 200, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
       }
+      const translations = {};
+      for (const target of body.targets || []) translations[target] = translationsByLang[target];
       return Promise.resolve({
         ok: true,
-        json: () => Promise.resolve({ en: 'Hello there', ja: 'こんにちは' }),
+        status: 200,
+        json: () => Promise.resolve({ source: body.source, translations }),
       });
     },
     console,
   };
-  if (audioRecord) {
-    sandbox.window.AudioContext = fakeAudioContext(audioRecord);
-  }
   sandbox.window.window = sandbox.window;
+  sandbox.window.localStorage = sandbox.localStorage;
+  if (audio) sandbox.window.AudioContext = fakeAudioContext(audio);
+
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(APP_JS, 'utf8'), sandbox);
 
-  return { els, fetchCalls, state, spoken };
+  return { els, fetchCalls, spoken, state, stored, langButtons };
 }
 
 function result(transcript, isFinal) {
-  return {
-    resultIndex: 0,
-    results: [Object.assign([{ transcript }], { isFinal })],
-  };
+  return { resultIndex: 0, results: [Object.assign([{ transcript }], { isFinal })] };
 }
 
 const failures = [];
 function check(name, cond, detail) {
-  const line = `${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`;
-  console.log(line);
+  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`);
   if (!cond) failures.push(name);
 }
 
-async function tick() {
-  await new Promise((r) => setTimeout(r, 20));
-}
+const tick = () => new Promise((r) => setTimeout(r, 20));
+const newAudioRecord = () => ({ gains: [], compressors: [], decoded: [], started: [], resumed: false });
 
 async function endsWithoutFinalResult() {
   console.log('\n# recognition ends with only an interim result (mobile)');
@@ -174,40 +208,32 @@ async function endsWithoutFinalResult() {
 
   els.micBtn._fire('click');
   check('recognition started', state.recognition && state.recognition.started);
+  check('recognition uses the source language', state.recognition.lang === 'vi-VN',
+        `lang: ${state.recognition.lang}`);
 
   state.recognition.fire('result', result('xin chào bạn', false));
-  const vnText = els.vietnameseText.textContent;
+  const sourceValue = els.sourceText.value;
   const listeningStatus = els.micStatus.textContent;
 
   state.recognition.fire('end');
   await tick();
 
-  check('Vietnamese text shown from interim result', vnText === 'xin chào bạn', `got "${vnText}"`);
-  check('status said listening during recognition', listeningStatus === 'Đang nghe...');
-  check('translation was requested on end', fetchCalls.length === 1, `fetch calls: ${fetchCalls.length}`);
-  if (fetchCalls.length) {
-    check('sent the interim transcript', JSON.parse(fetchCalls[0].body).text === 'xin chào bạn');
-    check('hit /api/translate', fetchCalls[0].url === '/api/translate');
+  check('source box filled from interim result', sourceValue === 'xin chào bạn', `got "${sourceValue}"`);
+  check('status said listening', listeningStatus === 'Đang nghe...');
+  const translateCalls = fetchCalls.filter((c) => c.url === '/api/translate');
+  check('translation requested on end', translateCalls.length === 1, `calls: ${translateCalls.length}`);
+  if (translateCalls.length) {
+    check('sent the interim transcript', translateCalls[0].body.text === 'xin chào bạn');
+    check('sent source and both targets',
+          translateCalls[0].body.source === 'vi' &&
+          translateCalls[0].body.targets.join(',') === 'en,ja',
+          JSON.stringify(translateCalls[0].body));
   }
-  check('English filled in', els.englishText.textContent === 'Hello there', `got "${els.englishText.textContent}"`);
-  check('Japanese filled in', els.japaneseText.textContent === 'こんにちは');
-  check('speak buttons enabled', !els.speakEnBtn.disabled && !els.speakJaBtn.disabled);
+  check('first target filled', els.targetText0.textContent === 'Hello there', `got "${els.targetText0.textContent}"`);
+  check('second target filled', els.targetText1.textContent === 'こんにちは');
+  check('speak buttons enabled', !els.speakBtn0.disabled && !els.speakBtn1.disabled);
   check('status not stuck on listening', els.micStatus.textContent !== 'Đang nghe...',
         `got "${els.micStatus.textContent}"`);
-}
-
-async function finalResultTranslatesOnce() {
-  console.log('\n# a final result translates exactly once');
-  const { els, fetchCalls, state } = loadApp();
-
-  els.micBtn._fire('click');
-  state.recognition.fire('result', result('xin chào bạn', true));
-  await tick();
-  state.recognition.fire('end');
-  await tick();
-
-  check('translated once, not twice', fetchCalls.length === 1, `fetch calls: ${fetchCalls.length}`);
-  check('English filled in', els.englishText.textContent === 'Hello there');
 }
 
 async function noSpeechKeepsItsMessage() {
@@ -219,126 +245,184 @@ async function noSpeechKeepsItsMessage() {
   state.recognition.fire('end');
   await tick();
 
-  check('nothing translated', fetchCalls.length === 0, `fetch calls: ${fetchCalls.length}`);
+  check('nothing translated', fetchCalls.filter((c) => c.url === '/api/translate').length === 0);
   check('error message preserved', els.micStatus.textContent === 'Không nghe thấy gì, thử lại nhé.',
         `got "${els.micStatus.textContent}"`);
 }
 
-async function speakBoth(voiceList, audioRecord) {
-  const app = loadApp(voiceList, audioRecord);
-  app.els.micBtn._fire('click');
-  app.state.recognition.fire('result', result('xin chào bạn', true));
+async function switchingSourceLanguage() {
+  console.log('\n# switching the source language repoints everything');
+  const { els, fetchCalls, state, langButtons, stored } = loadApp();
+
+  check('starts on Vietnamese', els.langSwitch.children[0].classList.contains('active'));
+  check('targets start as English and Japanese',
+        els.targetLabel0.textContent.includes('English') && els.targetLabel1.textContent.includes('日本語'),
+        `${els.targetLabel0.textContent} / ${els.targetLabel1.textContent}`);
+
+  // Switch to Japanese as the spoken language.
+  els.langSwitch._fire('click', { target: langButtons[2] });
+
+  check('Japanese button active', langButtons[2].classList.contains('active'));
+  check('Vietnamese button no longer active', !langButtons[0].classList.contains('active'));
+  check('targets became Vietnamese and English',
+        els.targetLabel0.textContent.includes('Tiếng Việt') && els.targetLabel1.textContent.includes('English'),
+        `${els.targetLabel0.textContent} / ${els.targetLabel1.textContent}`);
+  check('choice persisted', stored.get('duolang.sourceLang') === 'ja', stored.get('duolang.sourceLang'));
+
+  els.micBtn._fire('click');
+  check('recognition switched language', state.recognition.lang === 'ja-JP', `lang: ${state.recognition.lang}`);
+
+  state.recognition.fire('result', result('お手洗いはどこですか', true));
   await tick();
-  app.els.speakEnBtn._fire('click');
-  app.els.speakJaBtn._fire('click');
-  return app;
+
+  const call = fetchCalls.filter((c) => c.url === '/api/translate').pop();
+  check('translate called with Japanese source', call && call.body.source === 'ja', JSON.stringify(call && call.body));
+  check('targets are the other two', call && call.body.targets.join(',') === 'vi,en',
+        call && call.body.targets.join(','));
+  check('Vietnamese pane filled', els.targetText0.textContent === 'Xin chào', `got "${els.targetText0.textContent}"`);
 }
 
-async function ttsPicksBestVoice() {
-  console.log('\n# TTS picks the best voice, never a character voice');
-  const { spoken } = await speakBoth();
+async function restoresStoredSourceLanguage() {
+  console.log('\n# the previous source language is restored on load');
+  const { els, langButtons } = loadApp({ storedLang: 'en' });
 
-  check('both languages spoken', spoken.length === 2, `utterances: ${spoken.length}`);
-  if (spoken.length === 2) {
-    const [en, ja] = spoken;
-    check('English at full volume', en.volume === 1, `volume: ${en.volume}`);
-    check('English is not Grandpa or Fred',
-          en.voice && !/grandpa|fred/i.test(en.voice.name), `picked: ${en.voice && en.voice.name}`);
-    check('English prefers enhanced over compact',
-          en.voice && en.voice.voiceURI.includes('enhanced'), `picked: ${en.voice && en.voice.voiceURI}`);
-    check('Japanese is not Grandma',
-          ja.voice && !/grandma/i.test(ja.voice.name), `picked: ${ja.voice && ja.voice.name}`);
-    check('Japanese prefers premium',
-          ja.voice && ja.voice.voiceURI.includes('premium'), `picked: ${ja.voice && ja.voice.voiceURI}`);
-    check('Japanese spoke the translated text', ja.text === 'こんにちは', `got "${ja.text}"`);
-  }
+  check('English button active', langButtons[1].classList.contains('active'));
+  check('targets are Vietnamese and Japanese',
+        els.targetLabel0.textContent.includes('Tiếng Việt') && els.targetLabel1.textContent.includes('日本語'),
+        `${els.targetLabel0.textContent} / ${els.targetLabel1.textContent}`);
+  check('prompt mentions English', els.micStatus.textContent.includes('Anh'), els.micStatus.textContent);
 }
 
-async function ttsDefersToPlatformWhenOnlyNoveltyVoices() {
-  console.log('\n# TTS lets the platform choose when every voice is a novelty one');
-  const { spoken } = await speakBoth([
-    { name: 'Grandpa', voiceURI: 'com.apple.voice.super-compact.en-US.Grandpa', lang: 'en-US' },
-    { name: 'Zarvox', voiceURI: 'com.apple.speech.synthesis.voice.Zarvox', lang: 'en-US' },
-  ]);
+async function editingSourceText() {
+  console.log('\n# the source text can be corrected and retranslated');
+  const { els, fetchCalls, state } = loadApp();
 
-  check('still spoke', spoken.length === 2, `utterances: ${spoken.length}`);
-  if (spoken.length) {
-    check('no voice forced', !spoken[0].voice, `voice: ${spoken[0].voice && spoken[0].voice.name}`);
-    check('lang still set for the platform to use', spoken[0].lang === 'en-US', `lang: ${spoken[0].lang}`);
-  }
+  check('retranslate disabled while empty', els.retranslateBtn.disabled === true);
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  check('retranslate disabled right after translating', els.retranslateBtn.disabled === true,
+        'text matches what was translated');
+
+  // STT misheard: the user fixes the text by hand.
+  els.sourceText.value = 'xin chào bạn nhé';
+  els.sourceText._fire('input');
+
+  check('retranslate enabled once the text differs', els.retranslateBtn.disabled === false);
+
+  const before = fetchCalls.filter((c) => c.url === '/api/translate').length;
+  els.retranslateBtn._fire('click');
+  await tick();
+
+  const calls = fetchCalls.filter((c) => c.url === '/api/translate');
+  check('retranslated', calls.length === before + 1, `${before} -> ${calls.length}`);
+  check('sent the corrected text', calls[calls.length - 1].body.text === 'xin chào bạn nhé',
+        calls[calls.length - 1].body.text);
+  check('retranslate disabled again afterwards', els.retranslateBtn.disabled === true);
 }
 
-function newAudioRecord() {
-  return { sources: [], gains: [], compressors: [], decoded: [], started: [], resumed: false };
-}
-
-async function serverTtsPlaysThroughWebAudio() {
-  console.log('\n# server TTS plays through Web Audio with gain above unity');
+async function ttsPicksBestVoiceAndGain() {
+  console.log('\n# TTS: best device voice as fallback, real gain on the server path');
   const audio = newAudioRecord();
-  const { fetchCalls, els } = await speakBoth(undefined, audio);
+  const { els, fetchCalls, state } = loadApp({ audio });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  els.speakBtn0._fire('click');
+  els.speakBtn1._fire('click');
   await tick();
 
   const ttsCalls = fetchCalls.filter((c) => c.url === '/api/tts');
-  check('requested synthesis for both languages', ttsCalls.length === 2, `tts calls: ${ttsCalls.length}`);
+  check('synthesis requested per language', ttsCalls.length === 2, `tts calls: ${ttsCalls.length}`);
   if (ttsCalls.length === 2) {
-    const bodies = ttsCalls.map((c) => JSON.parse(c.body));
-    check('English request well formed',
-          bodies[0].lang === 'en' && bodies[0].text === 'Hello there', c$(bodies[0]));
-    check('Japanese request well formed',
-          bodies[1].lang === 'ja' && bodies[1].text === 'こんにちは', c$(bodies[1]));
+    check('English request well formed', ttsCalls[0].body.lang === 'en' && ttsCalls[0].body.text === 'Hello there',
+          JSON.stringify(ttsCalls[0].body));
+    check('Japanese request well formed', ttsCalls[1].body.lang === 'ja' && ttsCalls[1].body.text === 'こんにちは',
+          JSON.stringify(ttsCalls[1].body));
   }
   check('audio context resumed inside the gesture', audio.resumed === true);
-  check('audio actually started', audio.started.length === 2, `starts: ${audio.started.length}`);
-  check('decoded the returned wav', audio.decoded.length === 2, `decodes: ${audio.decoded.length}`);
+  check('audio started for both', audio.started.length === 2, `starts: ${audio.started.length}`);
 
-  // peak 0.25 -> normalising gain 0.99/0.25 = 3.96, then a make-up stage.
-  const gainValues = audio.gains.map((g) => g.gain.value);
-  check('normalising gain lifts the quiet clip', gainValues.some((v) => v > 3.5 && v < 4.5),
-        `gains: ${gainValues.join(', ')}`);
-  check('make-up gain above unity applied', gainValues.some((v) => v === 3),
-        `gains: ${gainValues.join(', ')}`);
-  check('compressor limits rather than gently compresses',
+  const gains = audio.gains.map((g) => g.gain.value);
+  check('normalising gain lifts the quiet clip', gains.some((v) => v > 3.5 && v < 4.5), `gains: ${gains.join(', ')}`);
+  check('make-up gain above unity', gains.some((v) => v === 3), `gains: ${gains.join(', ')}`);
+  check('limiting, not gentle compression',
         audio.compressors.every((c) => c.ratio.value >= 20 && c.threshold.value === -12),
         audio.compressors.map((c) => `t=${c.threshold.value} r=${c.ratio.value}`).join(', '));
-  check('no loading spinner left behind',
-        !els.speakEnBtn.classList.contains('loading') && !els.speakJaBtn.classList.contains('loading'));
+  check('no spinner left behind',
+        !els.speakBtn0.classList.contains('loading') && !els.speakBtn1.classList.contains('loading'));
 }
 
-async function serverTtsCachesPerSentence() {
-  console.log('\n# replaying the same sentence spends no extra request');
+async function ttsCachesPerSentence() {
+  console.log('\n# replaying a sentence spends no extra request');
   const audio = newAudioRecord();
-  const app = await speakBoth(undefined, audio);
+  const { els, fetchCalls, state } = loadApp({ audio });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  els.speakBtn0._fire('click');
   await tick();
 
-  const before = app.fetchCalls.filter((c) => c.url === '/api/tts').length;
-  app.els.speakEnBtn._fire('click');
+  const before = fetchCalls.filter((c) => c.url === '/api/tts').length;
+  els.speakBtn0._fire('click');
   await tick();
-  const after = app.fetchCalls.filter((c) => c.url === '/api/tts').length;
+  const after = fetchCalls.filter((c) => c.url === '/api/tts').length;
 
   check('no new synthesis request', after === before, `${before} -> ${after}`);
-  check('but it played again', audio.started.length === 3, `starts: ${audio.started.length}`);
+  check('but it played again', audio.started.length === 2, `starts: ${audio.started.length}`);
 }
 
-async function fallsBackToDeviceVoiceWithoutWebAudio() {
-  console.log('\n# without Web Audio it falls back to the device voice');
-  const { spoken, fetchCalls } = await speakBoth();
+async function quotaExhaustedFallsBack() {
+  console.log('\n# a 429 falls back to the device voice and says so');
+  const audio = newAudioRecord();
+  const { els, spoken, state } = loadApp({ audio, ttsStatus: 429 });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  els.speakBtn0._fire('click');
+  await tick();
+
+  check('device voice used instead', spoken.length === 1, `utterances: ${spoken.length}`);
+  check('spoke the translation', spoken.length && spoken[0].text === 'Hello there');
+  check('told the user why', els.errorMsg.hidden === false && /quota/i.test(els.errorMsg.textContent),
+        els.errorMsg.textContent);
+  check('English avoided the character voices',
+        spoken.length && spoken[0].voice && !/grandpa|fred/i.test(spoken[0].voice.name),
+        spoken.length && spoken[0].voice && spoken[0].voice.name);
+}
+
+async function withoutWebAudioUsesDeviceVoice() {
+  console.log('\n# without Web Audio it uses the device voice directly');
+  const { els, fetchCalls, spoken, state } = loadApp();
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  els.speakBtn1._fire('click');
   await tick();
 
   check('no synthesis requests', fetchCalls.filter((c) => c.url === '/api/tts').length === 0);
-  check('device voice used instead', spoken.length === 2, `utterances: ${spoken.length}`);
+  check('device voice used', spoken.length === 1, `utterances: ${spoken.length}`);
+  check('Japanese avoided Grandma',
+        spoken.length && spoken[0].voice && spoken[0].voice.name === 'Hattori',
+        spoken.length && spoken[0].voice && spoken[0].voice.name);
 }
-
-const c$ = (o) => JSON.stringify(o);
 
 (async () => {
   await endsWithoutFinalResult();
-  await finalResultTranslatesOnce();
   await noSpeechKeepsItsMessage();
-  await ttsPicksBestVoice();
-  await ttsDefersToPlatformWhenOnlyNoveltyVoices();
-  await serverTtsPlaysThroughWebAudio();
-  await serverTtsCachesPerSentence();
-  await fallsBackToDeviceVoiceWithoutWebAudio();
+  await switchingSourceLanguage();
+  await restoresStoredSourceLanguage();
+  await editingSourceText();
+  await ttsPicksBestVoiceAndGain();
+  await ttsCachesPerSentence();
+  await quotaExhaustedFallsBack();
+  await withoutWebAudioUsesDeviceVoice();
 
   if (failures.length) {
     console.log(`\n${failures.length} check(s) failed`);
