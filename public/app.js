@@ -72,9 +72,18 @@ if (!SpeechRecognitionImpl) {
   recognition.maxAlternatives = 1;
 
   let isRecording = false;
+  // Best transcript seen this session, final or not. Mobile browsers routinely
+  // end recognition without ever marking a result final -- especially when the
+  // user taps the button to stop -- so the interim text is all we get.
+  let lastTranscript = '';
+  let translationStarted = false;
+  let sessionFailed = false;
 
   recognition.addEventListener('start', () => {
     isRecording = true;
+    lastTranscript = '';
+    translationStarted = false;
+    sessionFailed = false;
     micBtn.classList.add('recording');
     micStatus.textContent = 'Đang nghe...';
     clearError();
@@ -83,15 +92,24 @@ if (!SpeechRecognitionImpl) {
   recognition.addEventListener('end', () => {
     isRecording = false;
     micBtn.classList.remove('recording');
+    if (!translationStarted && lastTranscript) {
+      translationStarted = true;
+      translate(lastTranscript);
+    } else if (!translationStarted && !sessionFailed) {
+      micStatus.textContent = 'Bấm micro và nói tiếng Việt';
+    }
   });
 
   recognition.addEventListener('error', (event) => {
     isRecording = false;
+    sessionFailed = true;
     micBtn.classList.remove('recording');
     if (event.error === 'no-speech') {
       micStatus.textContent = 'Không nghe thấy gì, thử lại nhé.';
     } else if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
       showError('Cần cấp quyền micro cho trang này.');
+    } else if (event.error === 'aborted') {
+      micStatus.textContent = 'Bấm micro và nói tiếng Việt';
     } else {
       showError('Lỗi nhận diện giọng nói: ' + event.error);
     }
@@ -109,11 +127,14 @@ if (!SpeechRecognitionImpl) {
       }
     }
 
+    const text = (finalTranscript || interimTranscript).trim();
+    if (!text) return;
+
+    lastTranscript = text;
+    setText(vietnameseText, text, false);
     if (finalTranscript) {
-      setText(vietnameseText, finalTranscript.trim(), false);
-      translate(finalTranscript.trim());
-    } else if (interimTranscript) {
-      setText(vietnameseText, interimTranscript.trim(), false);
+      translationStarted = true;
+      translate(text);
     }
   });
 
