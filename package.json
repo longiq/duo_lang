@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node test/stt.test.js && node test/budget.test.js"
+    "test": "node test/stt.test.js && node test/budget.test.js",
+    "icons": "node tools/make-icons.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
