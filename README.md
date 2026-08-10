@@ -40,6 +40,8 @@ Mở trình duyệt tại `http://localhost:3000`.
 
 Để dùng trên điện thoại, cần deploy server lên một địa chỉ HTTPS công khai (Web Speech API và service worker yêu cầu HTTPS, trừ localhost). Có thể deploy miễn phí lên Render, Railway, Fly.io, hoặc VPS riêng — nhớ đặt biến môi trường `GEMINI_API_KEY` trên nền tảng deploy.
 
+Hướng dẫn deploy lên VPS riêng (vd. Oracle Cloud free tier) kèm Nginx + HTTPS: xem [`deploy/README.md`](deploy/README.md).
+
 Sau khi có URL HTTPS, mở bằng Chrome (Android) hoặc Safari (iOS) trên điện thoại → menu trình duyệt → **"Thêm vào Màn hình chính" / "Add to Home Screen"**.
 
 ## Cách dùng
