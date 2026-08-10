@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>DuoLang - Dịch song ngữ Anh/Nhật</title>
+  <meta name="theme-color" content="#1a1b2e" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="app-header">
+      <h1>DuoLang</h1>
+      <p class="subtitle">Nói tiếng Việt &rarr; dịch cùng lúc sang Anh &amp; Nhật</p>
+    </header>
+
+    <section class="mic-section">
+      <button id="micBtn" class="mic-btn" aria-label="Bấm để nói">
+        <svg viewBox="0 0 24 24" width="36" height="36" fill="currentColor">
+          <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
+          <path d="M19 11a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V22h2v-2.06A9 9 0 0 0 21 11h-2z"/>
+        </svg>
+      </button>
+      <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
+    </section>
+
+    <section class="card">
+      <div class="card-label">🇻🇳 Tiếng Việt</div>
+      <p id="vietnameseText" class="text-content placeholder">Câu bạn nói sẽ hiện ở đây...</p>
+    </section>
+
+    <section class="card">
+      <div class="card-label-row">
+        <div class="card-label">🇬🇧 English</div>
+        <button id="speakEnBtn" class="speak-btn" aria-label="Nghe tiếng Anh" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
+        </button>
+      </div>
+      <p id="englishText" class="text-content placeholder">Bản dịch tiếng Anh sẽ hiện ở đây...</p>
+    </section>
+
+    <section class="card">
+      <div class="card-label-row">
+        <div class="card-label">🇯🇵 日本語</div>
+        <button id="speakJaBtn" class="speak-btn" aria-label="Nghe tiếng Nhật" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
+        </button>
+      </div>
+      <p id="japaneseText" class="text-content placeholder">日本語の翻訳がここに表示されます...</p>
+    </section>
+
+    <p id="errorMsg" class="error-msg" hidden></p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

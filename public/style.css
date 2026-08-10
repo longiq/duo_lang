@@ -1,0 +1,149 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #1a1b2e 0%, #14152a 100%);
+  color: #f2f2f7;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  justify-content: center;
+}
+
+.app {
+  width: 100%;
+  max-width: 480px;
+  padding: 24px 16px 48px;
+}
+
+.app-header {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: 0.5px;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: #a0a3c0;
+  font-size: 14px;
+}
+
+.mic-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 24px 0 32px;
+}
+
+.mic-btn {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  border: none;
+  background: linear-gradient(135deg, #6c5ce7, #4834d4);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 4px 20px rgba(108, 92, 231, 0.5);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mic-btn:active {
+  transform: scale(0.95);
+}
+
+.mic-btn.recording {
+  background: linear-gradient(135deg, #ff6b6b, #e84118);
+  box-shadow: 0 0 0 8px rgba(232, 65, 24, 0.2);
+  animation: pulse 1.4s infinite;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(232, 65, 24, 0.4); }
+  70% { box-shadow: 0 0 0 16px rgba(232, 65, 24, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(232, 65, 24, 0); }
+}
+
+.mic-status {
+  margin-top: 12px;
+  font-size: 14px;
+  color: #a0a3c0;
+  text-align: center;
+}
+
+.card {
+  background: #22243c;
+  border-radius: 16px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  border: 1px solid #33355a;
+}
+
+.card-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #a0a3c0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.card-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.text-content {
+  margin: 8px 0 0;
+  font-size: 17px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.text-content.placeholder {
+  color: #6b6e8f;
+  font-style: italic;
+  font-size: 15px;
+}
+
+.speak-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  background: #33355a;
+  color: #f2f2f7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.speak-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.speak-btn:not(:disabled):active {
+  transform: scale(0.9);
+}
+
+.error-msg {
+  text-align: center;
+  color: #ff7675;
+  font-size: 14px;
+  margin-top: 16px;
+}
