@@ -165,7 +165,11 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
       fetchCalls.push({ url, body });
       if (url === '/api/tts') {
         if (ttsStatus !== 200) {
-          return Promise.resolve({ ok: false, status: ttsStatus, json: () => Promise.resolve({}) });
+          return Promise.resolve({
+            ok: false,
+            status: ttsStatus,
+            json: () => Promise.resolve({ error: 'Đã dùng hết hạn mức giọng đọc tháng này.' }),
+          });
         }
         return Promise.resolve({ ok: true, status: 200, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
       }
@@ -389,7 +393,8 @@ async function quotaExhaustedFallsBack() {
 
   check('device voice used instead', spoken.length === 1, `utterances: ${spoken.length}`);
   check('spoke the translation', spoken.length && spoken[0].text === 'Hello there');
-  check('told the user why', els.errorMsg.hidden === false && /quota/i.test(els.errorMsg.textContent),
+  check('showed the reason the server gave',
+        els.errorMsg.hidden === false && /hạn mức/i.test(els.errorMsg.textContent),
         els.errorMsg.textContent);
   check('English avoided the character voices',
         spoken.length && spoken[0].voice && !/grandpa|fred/i.test(spoken[0].voice.name),

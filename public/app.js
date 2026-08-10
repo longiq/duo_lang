@@ -317,8 +317,11 @@ async function speakViaServer(ctx, text, lang) {
     });
     if (!res.ok) {
       const err = new Error('speech request failed');
-      // Distinguish the daily cap so the user is told why it sounds different.
+      // Distinguish the budget cap so the user is told why it sounds different.
       err.quotaExhausted = res.status === 429;
+      if (err.quotaExhausted) {
+        err.serverMessage = await res.json().then((d) => d && d.error).catch(() => null);
+      }
       throw err;
     }
     buffer = await decodeAudio(ctx, await res.arrayBuffer());
@@ -340,7 +343,7 @@ async function speak(text, lang, button) {
     // Offline, out of daily quota, or the service is unhappy: the device voice
     // is quieter but better than silence.
     if (err && err.quotaExhausted) {
-      showError('Hết quota giọng đọc chất lượng cao hôm nay, đang dùng giọng máy.');
+      showError(err.serverMessage || 'Hết hạn mức giọng đọc, đang dùng giọng máy.');
     }
     speakWithDeviceVoice(text, LANGS[lang].bcp47);
   } finally {
