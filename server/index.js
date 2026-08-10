@@ -8,7 +8,10 @@ const PORT = process.env.PORT || 3000;
 // so the app itself never needs to be exposed. Set HOST=0.0.0.0 for containers.
 const HOST = process.env.HOST || '127.0.0.1';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+// Pinned rather than gemini-flash-latest so the model can't change underneath
+// us. Check https://ai.google.dev/gemini-api/docs/models when bumping: retired
+// models don't 404, they report a free-tier quota of 0.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));

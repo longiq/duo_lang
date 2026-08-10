@@ -124,7 +124,7 @@ if [ -f "$APP_DIR/.env" ]; then
 else
   cat >"$APP_DIR/.env" <<'ENVEOF'
 GEMINI_API_KEY=REPLACE_ME
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-3.6-flash
 PORT=3000
 HOST=127.0.0.1
 ENVEOF
