@@ -4,6 +4,9 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+// Bind to loopback by default: in the documented deployment nginx proxies to us,
+// so the app itself never needs to be exposed. Set HOST=0.0.0.0 for containers.
+const HOST = process.env.HOST || '127.0.0.1';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
@@ -70,6 +73,6 @@ Vietnamese sentence: "${text}"`;
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`duo_lang server running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`duo_lang server running on http://${HOST}:${PORT}`);
 });
