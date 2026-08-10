@@ -52,11 +52,24 @@ function loadApp() {
     stop() { this.started = false; this.fire('end'); }
   }
 
+  const spoken = [];
+  const availableVoices = [
+    { name: 'Daniel (Compact)', voiceURI: 'com.apple.voice.compact.en-GB.Daniel', lang: 'en-GB' },
+    { name: 'Samantha', voiceURI: 'com.apple.voice.enhanced.en-US.Samantha', lang: 'en-US' },
+    { name: 'Kyoko (Compact)', voiceURI: 'com.apple.voice.compact.ja-JP.Kyoko', lang: 'ja-JP' },
+    { name: 'Hattori', voiceURI: 'com.apple.voice.enhanced.ja-JP.Hattori', lang: 'ja-JP' },
+  ];
+
   const sandbox = {
     document: { getElementById: (id) => els[id] || el(id) },
     window: {
       SpeechRecognition: FakeRecognition,
-      speechSynthesis: { cancel() {}, speak() {} },
+      speechSynthesis: {
+        cancel() {},
+        speak(u) { spoken.push(u); },
+        getVoices: () => availableVoices,
+        addEventListener() {},
+      },
       addEventListener() {},
     },
     navigator: {},
@@ -74,7 +87,7 @@ function loadApp() {
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(APP_JS, 'utf8'), sandbox);
 
-  return { els, fetchCalls, state };
+  return { els, fetchCalls, state, spoken };
 }
 
 function result(transcript, isFinal) {
@@ -151,10 +164,34 @@ async function noSpeechKeepsItsMessage() {
         `got "${els.micStatus.textContent}"`);
 }
 
+async function ttsPicksFullQualityVoice() {
+  console.log('\n# TTS avoids the low-quality compact voices');
+  const { els, state, spoken } = loadApp();
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  els.speakEnBtn._fire('click');
+  els.speakJaBtn._fire('click');
+
+  check('both languages spoken', spoken.length === 2, `utterances: ${spoken.length}`);
+  if (spoken.length === 2) {
+    const [en, ja] = spoken;
+    check('English at full volume', en.volume === 1, `volume: ${en.volume}`);
+    check('English skipped the compact voice', en.voice && en.voice.name === 'Samantha',
+          `picked: ${en.voice && en.voice.name}`);
+    check('Japanese skipped the compact voice', ja.voice && ja.voice.name === 'Hattori',
+          `picked: ${ja.voice && ja.voice.name}`);
+    check('Japanese spoke the translated text', ja.text === 'こんにちは', `got "${ja.text}"`);
+  }
+}
+
 (async () => {
   await endsWithoutFinalResult();
   await finalResultTranslatesOnce();
   await noSpeechKeepsItsMessage();
+  await ttsPicksFullQualityVoice();
 
   if (failures.length) {
     console.log(`\n${failures.length} check(s) failed`);

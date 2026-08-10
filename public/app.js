@@ -49,12 +49,43 @@ async function translate(text) {
   }
 }
 
+const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
+let voices = [];
+
+function loadVoices() {
+  voices = (synth && typeof synth.getVoices === 'function' && synth.getVoices()) || [];
+}
+loadVoices();
+// iOS returns an empty list until the voices finish loading.
+if (synth && typeof synth.addEventListener === 'function') {
+  synth.addEventListener('voiceschanged', loadVoices);
+}
+
+// Left to itself iOS tends to pick a low-quality "compact" voice, which sounds
+// thinner and quieter than the full one for the same language.
+function pickVoice(lang) {
+  const prefix = lang.split('-')[0].toLowerCase();
+  const matches = voices.filter((v) => {
+    const vl = (v.lang || '').toLowerCase().replace('_', '-');
+    return vl.startsWith(prefix);
+  });
+  if (!matches.length) return null;
+  const exact = matches.filter((v) => (v.lang || '').toLowerCase().replace('_', '-') === lang.toLowerCase());
+  const pool = exact.length ? exact : matches;
+  const isCompact = (v) => /compact|eloquence/i.test(v.voiceURI || v.name || '');
+  return pool.find((v) => !isCompact(v)) || pool[0];
+}
+
 function speak(text, lang) {
-  if (!text || !('speechSynthesis' in window)) return;
-  window.speechSynthesis.cancel();
+  if (!text || !synth) return;
+  synth.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = lang;
-  window.speechSynthesis.speak(utterance);
+  utterance.volume = 1;
+  utterance.rate = 0.95;
+  const voice = pickVoice(lang);
+  if (voice) utterance.voice = voice;
+  synth.speak(utterance);
 }
 
 speakEnBtn.addEventListener('click', () => speak(currentEn, 'en-US'));

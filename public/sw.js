@@ -1,13 +1,14 @@
 // Bump on every asset change so the browser sees a byte-different worker and
 // runs install/activate. The network-first strategy below means a missed bump
 // costs a stale response only while offline, not forever.
-const CACHE_NAME = 'duolang-v2';
+const CACHE_NAME = 'duolang-v3';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/style.css',
   '/app.js',
   '/manifest.json',
+  '/icons/icon-180.png',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

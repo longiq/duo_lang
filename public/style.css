@@ -19,7 +19,12 @@ body {
 .app {
   width: 100%;
   max-width: 480px;
-  padding: 24px 16px 48px;
+  /* The iOS status bar is translucent in standalone mode, so the top inset
+     keeps the header out from under the clock and notch. */
+  padding-top: max(24px, env(safe-area-inset-top));
+  padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(48px, env(safe-area-inset-bottom));
+  padding-left: max(16px, env(safe-area-inset-left));
 }
 
 .app-header {
