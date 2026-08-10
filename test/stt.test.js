@@ -31,7 +31,7 @@ function el(id) {
   };
 }
 
-function loadApp() {
+function loadApp(overrideVoices) {
   const ids = ['micBtn', 'micStatus', 'vietnameseText', 'englishText', 'japaneseText',
                'speakEnBtn', 'speakJaBtn', 'errorMsg'];
   const els = {};
@@ -53,11 +53,16 @@ function loadApp() {
   }
 
   const spoken = [];
-  const availableVoices = [
-    { name: 'Daniel (Compact)', voiceURI: 'com.apple.voice.compact.en-GB.Daniel', lang: 'en-GB' },
+  // Mirrors what iOS 17 actually offers: character voices and legacy novelty
+  // voices sit in the same list as the real ones, and Grandpa comes first.
+  const availableVoices = overrideVoices || [
+    { name: 'Grandpa', voiceURI: 'com.apple.voice.super-compact.en-US.Grandpa', lang: 'en-US' },
+    { name: 'Fred', voiceURI: 'com.apple.speech.synthesis.voice.Fred', lang: 'en-US' },
+    { name: 'Samantha (Compact)', voiceURI: 'com.apple.voice.compact.en-US.Samantha', lang: 'en-US', default: true },
     { name: 'Samantha', voiceURI: 'com.apple.voice.enhanced.en-US.Samantha', lang: 'en-US' },
+    { name: 'Grandma', voiceURI: 'com.apple.voice.super-compact.ja-JP.Grandma', lang: 'ja-JP' },
     { name: 'Kyoko (Compact)', voiceURI: 'com.apple.voice.compact.ja-JP.Kyoko', lang: 'ja-JP' },
-    { name: 'Hattori', voiceURI: 'com.apple.voice.enhanced.ja-JP.Hattori', lang: 'ja-JP' },
+    { name: 'Hattori', voiceURI: 'com.apple.voice.premium.ja-JP.Hattori', lang: 'ja-JP' },
   ];
 
   const sandbox = {
@@ -164,26 +169,47 @@ async function noSpeechKeepsItsMessage() {
         `got "${els.micStatus.textContent}"`);
 }
 
-async function ttsPicksFullQualityVoice() {
-  console.log('\n# TTS avoids the low-quality compact voices');
-  const { els, state, spoken } = loadApp();
-
-  els.micBtn._fire('click');
-  state.recognition.fire('result', result('xin chào bạn', true));
+async function speakBoth(voiceList) {
+  const app = loadApp(voiceList);
+  app.els.micBtn._fire('click');
+  app.state.recognition.fire('result', result('xin chào bạn', true));
   await tick();
+  app.els.speakEnBtn._fire('click');
+  app.els.speakJaBtn._fire('click');
+  return app;
+}
 
-  els.speakEnBtn._fire('click');
-  els.speakJaBtn._fire('click');
+async function ttsPicksBestVoice() {
+  console.log('\n# TTS picks the best voice, never a character voice');
+  const { spoken } = await speakBoth();
 
   check('both languages spoken', spoken.length === 2, `utterances: ${spoken.length}`);
   if (spoken.length === 2) {
     const [en, ja] = spoken;
     check('English at full volume', en.volume === 1, `volume: ${en.volume}`);
-    check('English skipped the compact voice', en.voice && en.voice.name === 'Samantha',
-          `picked: ${en.voice && en.voice.name}`);
-    check('Japanese skipped the compact voice', ja.voice && ja.voice.name === 'Hattori',
-          `picked: ${ja.voice && ja.voice.name}`);
+    check('English is not Grandpa or Fred',
+          en.voice && !/grandpa|fred/i.test(en.voice.name), `picked: ${en.voice && en.voice.name}`);
+    check('English prefers enhanced over compact',
+          en.voice && en.voice.voiceURI.includes('enhanced'), `picked: ${en.voice && en.voice.voiceURI}`);
+    check('Japanese is not Grandma',
+          ja.voice && !/grandma/i.test(ja.voice.name), `picked: ${ja.voice && ja.voice.name}`);
+    check('Japanese prefers premium',
+          ja.voice && ja.voice.voiceURI.includes('premium'), `picked: ${ja.voice && ja.voice.voiceURI}`);
     check('Japanese spoke the translated text', ja.text === 'こんにちは', `got "${ja.text}"`);
+  }
+}
+
+async function ttsDefersToPlatformWhenOnlyNoveltyVoices() {
+  console.log('\n# TTS lets the platform choose when every voice is a novelty one');
+  const { spoken } = await speakBoth([
+    { name: 'Grandpa', voiceURI: 'com.apple.voice.super-compact.en-US.Grandpa', lang: 'en-US' },
+    { name: 'Zarvox', voiceURI: 'com.apple.speech.synthesis.voice.Zarvox', lang: 'en-US' },
+  ]);
+
+  check('still spoke', spoken.length === 2, `utterances: ${spoken.length}`);
+  if (spoken.length) {
+    check('no voice forced', !spoken[0].voice, `voice: ${spoken[0].voice && spoken[0].voice.name}`);
+    check('lang still set for the platform to use', spoken[0].lang === 'en-US', `lang: ${spoken[0].lang}`);
   }
 }
 
@@ -191,7 +217,8 @@ async function ttsPicksFullQualityVoice() {
   await endsWithoutFinalResult();
   await finalResultTranslatesOnce();
   await noSpeechKeepsItsMessage();
-  await ttsPicksFullQualityVoice();
+  await ttsPicksBestVoice();
+  await ttsDefersToPlatformWhenOnlyNoveltyVoices();
 
   if (failures.length) {
     console.log(`\n${failures.length} check(s) failed`);

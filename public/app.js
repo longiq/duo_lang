@@ -61,19 +61,47 @@ if (synth && typeof synth.addEventListener === 'function') {
   synth.addEventListener('voiceschanged', loadVoices);
 }
 
-// Left to itself iOS tends to pick a low-quality "compact" voice, which sounds
-// thinner and quieter than the full one for the same language.
+// iOS ships character voices (Grandpa, Grandma, Jester, Rocko...) and legacy
+// novelty ones (Fred, Ralph, Zarvox...) right alongside the real ones, so
+// "first non-compact match" is not a safe pick -- it lands on those.
+const NOVELTY_VOICE = /grandpa|grandma|jester|rocko|sandy|shelley|eddy|\bflo\b|reed|rosa|bahh|albert|bad news|bells|boing|bubbles|cellos|deranged|fred|good news|hysterical|junior|kathy|organ|princess|ralph|trinoids|whisper|zarvox|wobble|superstar|bruce|agnes/i;
+
+const normLang = (l) => (l || '').toLowerCase().replace('_', '-');
+
+// Higher is better; below zero means never use it.
+function voiceScore(v) {
+  const uri = v.voiceURI || '';
+  const name = v.name || '';
+  if (NOVELTY_VOICE.test(name)) return -1;
+  if (/com\.apple\.speech\.synthesis\.voice/.test(uri)) return -1;
+  if (/eloquence/i.test(uri)) return -1;
+
+  let score;
+  if (/premium/i.test(uri)) score = 40;
+  else if (/enhanced/i.test(uri)) score = 30;
+  else if (/siri/i.test(uri)) score = 25;
+  else if (/compact/i.test(uri)) score = 5;
+  else score = 10;
+
+  if (v.default) score += 8;
+  if (v.localService === false) score += 3;
+  return score;
+}
+
 function pickVoice(lang) {
   const prefix = lang.split('-')[0].toLowerCase();
-  const matches = voices.filter((v) => {
-    const vl = (v.lang || '').toLowerCase().replace('_', '-');
-    return vl.startsWith(prefix);
-  });
+  const matches = voices.filter((v) => normLang(v.lang).startsWith(prefix));
   if (!matches.length) return null;
-  const exact = matches.filter((v) => (v.lang || '').toLowerCase().replace('_', '-') === lang.toLowerCase());
-  const pool = exact.length ? exact : matches;
-  const isCompact = (v) => /compact|eloquence/i.test(v.voiceURI || v.name || '');
-  return pool.find((v) => !isCompact(v)) || pool[0];
+
+  const exact = matches.filter((v) => normLang(v.lang) === lang.toLowerCase());
+  const ranked = (exact.length ? exact : matches)
+    .map((v) => ({ voice: v, score: voiceScore(v) }))
+    .filter((entry) => entry.score >= 0)
+    .sort((a, b) => b.score - a.score);
+
+  // If every candidate is a novelty voice, leave the choice to the platform
+  // rather than forcing a bad one.
+  return ranked.length ? ranked[0].voice : null;
 }
 
 function speak(text, lang) {
