@@ -30,17 +30,35 @@ const CLOUD_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY;
 // Overridable so tests can point at a local stand-in instead of spending quota.
 const CLOUD_TTS_ENDPOINT = process.env.CLOUD_TTS_ENDPOINT ||
   'https://texttospeech.googleapis.com/v1/text:synthesize';
-const CLOUD_TTS_VOICES = {
-  vi: { languageCode: 'vi-VN', name: process.env.CLOUD_VOICE_VI || 'vi-VN-Wavenet-A' },
-  en: { languageCode: 'en-US', name: process.env.CLOUD_VOICE_EN || 'en-US-Wavenet-F' },
-  ja: { languageCode: 'ja-JP', name: process.env.CLOUD_VOICE_JA || 'ja-JP-Wavenet-B' },
-};
+const LANG_CODES = { vi: 'vi-VN', en: 'en-US', ja: 'ja-JP' };
 
-// A cap the app enforces itself, well under the 1M/month free tier, so no
-// configuration mistake on the Google side can turn into a bill. Google's own
-// budget alerts only notify -- they do not stop spending.
-const TTS_MONTHLY_CHAR_LIMIT = Number(process.env.TTS_MONTHLY_CHAR_LIMIT || 200000);
+// Google's free allowance is per voice tier, not per project, so working down
+// the tiers as each one runs out adds up to 7M characters a month instead of 1M.
+// Voice names below were all confirmed present via the voices endpoint.
+const TIER_FREE_CHARS = { 'Chirp3-HD': 1000000, Neural2: 1000000, Wavenet: 1000000, Standard: 4000000 };
+const TIER_VOICES = {
+  'Chirp3-HD': { vi: 'vi-VN-Chirp3-HD-Achernar', en: 'en-US-Chirp3-HD-Achernar', ja: 'ja-JP-Chirp3-HD-Achernar' },
+  Neural2: { vi: 'vi-VN-Neural2-A', en: 'en-US-Neural2-F', ja: 'ja-JP-Neural2-B' },
+  Wavenet: { vi: 'vi-VN-Wavenet-A', en: 'en-US-Wavenet-F', ja: 'ja-JP-Wavenet-B' },
+  Standard: { vi: 'vi-VN-Standard-A', en: 'en-US-Standard-C', ja: 'ja-JP-Standard-A' },
+};
+// Best quality first. Reorder to taste; every tier here is free within its cap.
+const TTS_TIER_ORDER = (process.env.TTS_TIER_ORDER || 'Chirp3-HD,Neural2,Wavenet,Standard')
+  .split(',').map((t) => t.trim()).filter((t) => TIER_VOICES[t]);
+
+// Each tier is capped below its own free allowance, so no configuration mistake
+// on the Google side can turn into a bill. Google's budget alerts only notify --
+// they do not stop spending.
+const TTS_BUDGET_FRACTION = Number(process.env.TTS_BUDGET_FRACTION || 0.8);
+// Optional ceiling across all tiers combined. Off unless set above zero.
+const TTS_MONTHLY_CHAR_LIMIT = Number(process.env.TTS_MONTHLY_CHAR_LIMIT || 0);
 const TTS_USAGE_FILE = process.env.TTS_USAGE_FILE || path.join(__dirname, '..', 'tts-usage.json');
+
+function tierBudget(tier) {
+  const explicit = Number(process.env[`TTS_BUDGET_${tier.toUpperCase().replace(/-/g, '_')}`] || 0);
+  if (explicit > 0) return explicit;
+  return Math.floor((TIER_FREE_CHARS[tier] || 0) * TTS_BUDGET_FRACTION);
+}
 
 const LANG_NAMES = { vi: 'Vietnamese', en: 'English', ja: 'Japanese' };
 const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
@@ -200,18 +218,18 @@ function readUsage() {
   const period = currentPeriod();
   try {
     const saved = JSON.parse(fs.readFileSync(TTS_USAGE_FILE, 'utf8'));
-    if (saved && saved.period === period && Number.isFinite(saved.chars)) {
-      return { period, chars: saved.chars };
+    if (saved && saved.period === period && saved.tiers) {
+      return { period, tiers: { ...saved.tiers } };
     }
   } catch (err) {
-    // Missing or unreadable: start the period at zero.
+    // Missing, unreadable, or a new month: start the period at zero.
   }
-  return { period, chars: 0 };
+  return { period, tiers: {} };
 }
 
-function recordUsage(chars) {
+function recordUsage(tier, chars) {
   const usage = readUsage();
-  usage.chars += chars;
+  usage.tiers[tier] = (usage.tiers[tier] || 0) + chars;
   try {
     fs.writeFileSync(TTS_USAGE_FILE, JSON.stringify(usage));
   } catch (err) {
@@ -220,21 +238,49 @@ function recordUsage(chars) {
   return usage;
 }
 
-function budgetRemaining() {
-  return Math.max(0, TTS_MONTHLY_CHAR_LIMIT - readUsage().chars);
+function totalUsed(usage) {
+  return Object.values(usage.tiers).reduce((sum, n) => sum + n, 0);
+}
+
+function tierRemaining(tier, usage = readUsage()) {
+  return Math.max(0, tierBudget(tier) - (usage.tiers[tier] || 0));
+}
+
+// Tiers that returned 429 from Google this period: their real quota ran out
+// before our own cap did, so stop offering them until the month rolls over.
+const exhaustedTiers = new Map();
+
+function isExhausted(tier) {
+  return exhaustedTiers.get(tier) === currentPeriod();
+}
+
+function markExhausted(tier) {
+  exhaustedTiers.set(tier, currentPeriod());
+}
+
+// First tier with room for this text, working down from best quality.
+function pickTier(chars) {
+  const usage = readUsage();
+  if (TTS_MONTHLY_CHAR_LIMIT > 0 && totalUsed(usage) + chars > TTS_MONTHLY_CHAR_LIMIT) {
+    return null;
+  }
+  for (const tier of TTS_TIER_ORDER) {
+    if (isExhausted(tier)) continue;
+    if (tierRemaining(tier, usage) >= chars) return tier;
+  }
+  return null;
 }
 
 // --- synthesis providers ----------------------------------------------------
 
-async function synthesiseWithCloudTts(text, lang) {
-  const voice = CLOUD_TTS_VOICES[lang];
+async function synthesiseWithCloudTts(text, lang, tier) {
   const url = `${CLOUD_TTS_ENDPOINT}?key=${CLOUD_TTS_API_KEY}`;
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       input: { text },
-      voice: { languageCode: voice.languageCode, name: voice.name },
+      voice: { languageCode: LANG_CODES[lang], name: TIER_VOICES[tier][lang] },
       // LINEAR16 comes back as a complete WAV, header included, so it needs no
       // repackaging before decodeAudioData.
       audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 24000 },
@@ -319,62 +365,91 @@ app.post('/api/tts', async (req, res) => {
   }
 
   const cacheKey = `${lang}|${text}`;
-  const sendWav = (wav, hit) => {
+  const sendWav = (wav, hit, tier) => {
     res.set({
       'Content-Type': 'audio/wav',
       'Content-Length': String(wav.length),
       'Cache-Control': 'public, max-age=86400',
       'X-Cache': hit ? 'hit' : 'miss',
+      'X-TTS-Tier': tier || 'cache',
     });
     res.send(wav);
   };
 
-  // Served from cache costs nothing, so it is checked before the budget.
+  // A cache hit costs nothing, so it is served before any budget check.
   const cached = cacheGet(cacheKey);
   if (cached) return sendWav(cached, true);
 
-  // Cloud TTS bills per character, so the app refuses before spending rather
-  // than relying on Google-side configuration.
-  if (useCloud) {
-    const remaining = budgetRemaining();
-    if (text.length > remaining) {
-      console.warn(`TTS monthly budget reached: ${readUsage().chars}/${TTS_MONTHLY_CHAR_LIMIT} chars`);
-      return res.status(429).json({
-        error: 'Đã dùng hết hạn mức giọng đọc tháng này.',
-        remaining,
-      });
+  if (!useCloud) {
+    try {
+      const wav = await synthesiseWithGemini(text, lang);
+      cacheSet(cacheKey, wav);
+      return sendWav(wav, false, 'gemini');
+    } catch (err) {
+      console.error('Gemini TTS failed:', err.message, err.body || '');
+      if (err.status === 429) {
+        return res.status(429).json({ error: 'Hết hạn mức giọng đọc hôm nay, tạm dùng giọng máy.' });
+      }
+      return res.status(502).json({ error: 'Speech service error.' });
     }
   }
 
-  try {
-    const wav = useCloud
-      ? await synthesiseWithCloudTts(text, lang)
-      : await synthesiseWithGemini(text, lang);
+  // Cloud TTS bills per character, so work down the tiers and refuse before
+  // spending rather than relying on Google-side configuration being right.
+  let lastError = null;
+  for (;;) {
+    const tier = pickTier(text.length);
+    if (!tier) break;
 
-    if (useCloud) recordUsage(text.length);
-    cacheSet(cacheKey, wav);
-    sendWav(wav, false);
-  } catch (err) {
-    console.error('TTS request failed:', err.message, err.body || '');
-    // 429 is worth distinguishing: the client says why it sounds different and
-    // falls back to the device voice instead of reporting a generic failure.
-    if (err.status === 429) {
-      return res.status(429).json({ error: 'Hết hạn mức giọng đọc, tạm dùng giọng máy.' });
+    try {
+      const wav = await synthesiseWithCloudTts(text, lang, tier);
+      recordUsage(tier, text.length);
+      cacheSet(cacheKey, wav);
+      return sendWav(wav, false, tier);
+    } catch (err) {
+      lastError = err;
+      if (err.status === 429) {
+        // Google's own quota for this tier ran out before our cap did.
+        console.warn(`TTS tier ${tier} hit Google's quota, trying the next tier`);
+        markExhausted(tier);
+        continue;
+      }
+      console.error(`Cloud TTS failed on ${tier}:`, err.message, err.body || '');
+      return res.status(502).json({ error: 'Speech service error.' });
     }
-    res.status(502).json({ error: 'Speech service error.' });
   }
+
+  const usage = readUsage();
+  console.warn(`TTS budget exhausted across all tiers: ${JSON.stringify(usage.tiers)}`);
+  return res.status(429).json({
+    error: 'Đã dùng hết hạn mức giọng đọc tháng này.',
+    detail: lastError ? lastError.message : 'all tiers at budget',
+  });
 });
 
-// Lets the deploy check how much of the monthly allowance is gone without
+// Lets the deploy see where the monthly allowance stands per tier without
 // digging through logs.
 app.get('/api/tts/usage', (req, res) => {
   const usage = readUsage();
+  const tiers = TTS_TIER_ORDER.map((tier) => ({
+    tier,
+    voiceExample: TIER_VOICES[tier].vi,
+    used: usage.tiers[tier] || 0,
+    budget: tierBudget(tier),
+    remaining: tierRemaining(tier, usage),
+    googleFreeTier: TIER_FREE_CHARS[tier],
+    quotaExhausted: isExhausted(tier),
+  }));
+
   res.json({
     provider: CLOUD_TTS_API_KEY ? 'google-cloud-tts' : 'gemini',
     period: usage.period,
-    charsUsed: usage.chars,
-    charLimit: TTS_MONTHLY_CHAR_LIMIT,
-    remaining: budgetRemaining(),
+    order: TTS_TIER_ORDER,
+    totalUsed: totalUsed(usage),
+    totalBudget: tiers.reduce((sum, t) => sum + t.budget, 0),
+    totalRemaining: tiers.reduce((sum, t) => sum + t.remaining, 0),
+    overallLimit: TTS_MONTHLY_CHAR_LIMIT || null,
+    tiers,
   });
 });
 

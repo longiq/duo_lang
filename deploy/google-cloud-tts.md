@@ -31,26 +31,56 @@ Cơ chế chặn thật là quota:
 
 Vượt ngưỡng thì API trả **429**, không tạo thêm usage, nên không phát sinh tiền. Không phụ thuộc độ trễ báo cáo chi phí.
 
-## 4. Lớp chặn 2 — cap trong chính app
+## 4. Lớp chặn 2 — cap theo từng tier trong app
 
-Server tự đếm ký tự đã dùng trong tháng, ghi ra `tts-usage.json`, và **từ chối trước khi gọi Google** khi vượt ngưỡng. Mặc định **200.000 ký tự/tháng = 20% free tier**.
+Free tier của Google **tính riêng cho từng loại giọng**, nên app dùng hết tier cao rồi tự tụt xuống tier thấp, cộng lại được nhiều hơn nhiều:
+
+| Tier | Google cho miễn phí/tháng | Cap app (80%) |
+|---|---|---|
+| Chirp3-HD | 1M | 800.000 |
+| Neural2 | 1M | 800.000 |
+| WaveNet | 1M | 800.000 |
+| Standard | 4M | 3.200.000 |
+| **Tổng** | **7M** | **5.600.000** |
+
+5,6 triệu ký tự ≈ **93.000 câu/tháng** (~3.000 câu/ngày).
+
+Server đếm riêng từng tier, ghi ra `tts-usage.json`, và **từ chối trước khi gọi Google** khi mọi tier đã hết. Nếu Google trả 429 cho một tier (quota bên họ hết trước cap của mình), app đánh dấu tier đó và chuyển xuống tier dưới ngay trong cùng request.
 
 ```bash
 # /opt/duolang/.env
 GOOGLE_TTS_API_KEY=<key vua tao>
-TTS_MONTHLY_CHAR_LIMIT=200000
+TTS_BUDGET_FRACTION=0.8
+TTS_TIER_ORDER=Chirp3-HD,Neural2,Wavenet,Standard
 ```
 
 Kiểm tra mức đã dùng bất cứ lúc nào:
 
 ```bash
-curl -s https://duolang.longiq.xyz/api/tts/usage
-# {"provider":"google-cloud-tts","period":"2026-08","charsUsed":1234,"charLimit":200000,"remaining":198766}
+curl -s https://duolang.longiq.xyz/api/tts/usage | python3 -m json.tool
 ```
 
-Bộ đếm ghi ra đĩa nên restart server không reset. Vượt ngưỡng thì app tự lùi về giọng máy kèm thông báo, không phải im lặng.
+```json
+{
+  "provider": "google-cloud-tts",
+  "period": "2026-08",
+  "totalUsed": 77,
+  "totalBudget": 5600000,
+  "totalRemaining": 5599923,
+  "tiers": [
+    { "tier": "Chirp3-HD", "used": 77, "budget": 800000, "remaining": 799923, "quotaExhausted": false },
+    { "tier": "Neural2",   "used": 0,  "budget": 800000, "remaining": 800000, "quotaExhausted": false }
+  ]
+}
+```
 
-Cache cũng giúp tiết kiệm: nghe lại câu đã đọc **không tốn ký tự nào**.
+Response của `/api/tts` có header `X-TTS-Tier` cho biết tier nào đã đọc câu đó.
+
+Bộ đếm ghi ra đĩa nên restart server không reset, và tự về 0 khi sang tháng mới. Hết toàn bộ thì app lùi về giọng máy kèm thông báo, không im lặng.
+
+Cache cũng giúp tiết kiệm: nghe lại câu đã đọc **không tốn ký tự nào và không gọi lên Google**.
+
+Muốn chặn tổng thể bất kể tier, đặt thêm `TTS_MONTHLY_CHAR_LIMIT` (mặc định tắt).
 
 ## 5. Lớp chặn 3 — budget alert để biết sớm
 
