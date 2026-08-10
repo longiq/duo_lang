@@ -1,0 +1,14 @@
+{
+  "name": "duo_lang",
+  "version": "1.0.0",
+  "description": "Vietnamese speech-to-text with simultaneous English + Japanese translation and text-to-speech",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
