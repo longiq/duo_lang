@@ -146,6 +146,29 @@ body {
   transform: scale(0.9);
 }
 
+/* Synthesis takes a moment, so the button shows it is working. */
+.speak-btn.loading {
+  pointer-events: none;
+}
+
+.speak-btn.loading svg {
+  display: none;
+}
+
+.speak-btn.loading::after {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border: 2px solid #6b6e8f;
+  border-top-color: #f2f2f7;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .error-msg {
   text-align: center;
   color: #ff7675;

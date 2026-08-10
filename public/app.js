@@ -104,20 +104,129 @@ function pickVoice(lang) {
   return ranked.length ? ranked[0].voice : null;
 }
 
-function speak(text, lang) {
+function speakWithDeviceVoice(text, bcp47) {
   if (!text || !synth) return;
   synth.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = lang;
+  utterance.lang = bcp47;
   utterance.volume = 1;
   utterance.rate = 0.95;
-  const voice = pickVoice(lang);
+  const voice = pickVoice(bcp47);
   if (voice) utterance.voice = voice;
   synth.speak(utterance);
 }
 
-speakEnBtn.addEventListener('click', () => speak(currentEn, 'en-US'));
-speakJaBtn.addEventListener('click', () => speak(currentJa, 'ja-JP'));
+// --- server-synthesised speech ---------------------------------------------
+// speechSynthesis on iOS plays back well below what the device can manage and
+// its volume is capped at 1. Routing server audio through Web Audio instead
+// allows gain above unity, which is the only way to actually get it louder.
+
+let audioCtx = null;
+let currentSource = null;
+const audioCache = new Map();
+
+// Must be called synchronously from the click handler: iOS only allows a
+// context to start or resume inside a user gesture.
+function ensureAudioContext() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  if (!audioCtx) audioCtx = new Ctx();
+  if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+    audioCtx.resume();
+  }
+  return audioCtx;
+}
+
+// Older Safari only has the callback form of decodeAudioData.
+function decodeAudio(ctx, bytes) {
+  return new Promise((resolve, reject) => {
+    const maybePromise = ctx.decodeAudioData(bytes, resolve, reject);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.then(resolve, reject);
+    }
+  });
+}
+
+function peakAmplitude(buffer) {
+  let peak = 0;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const samples = buffer.getChannelData(channel);
+    for (let i = 0; i < samples.length; i++) {
+      const value = Math.abs(samples[i]);
+      if (value > peak) peak = value;
+    }
+  }
+  return peak;
+}
+
+function playBuffer(ctx, buffer) {
+  if (currentSource) {
+    try { currentSource.stop(); } catch (err) { /* already finished */ }
+  }
+
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+
+  // Normalise to just under full scale, then compress and make up the level.
+  // Straight gain alone would clip the peaks instead of getting louder.
+  const normalise = ctx.createGain();
+  normalise.gain.value = Math.min(8, 0.99 / Math.max(peakAmplitude(buffer), 0.001));
+
+  const compressor = ctx.createDynamicsCompressor();
+  compressor.threshold.value = -18;
+  compressor.knee.value = 6;
+  compressor.ratio.value = 4;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.25;
+
+  const makeUp = ctx.createGain();
+  makeUp.gain.value = 1.8;
+
+  source.connect(normalise);
+  normalise.connect(compressor);
+  compressor.connect(makeUp);
+  makeUp.connect(ctx.destination);
+  source.start();
+  currentSource = source;
+}
+
+async function speakViaServer(ctx, text, lang) {
+  const key = `${lang}|${text}`;
+  let buffer = audioCache.get(key);
+
+  if (!buffer) {
+    const res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, lang }),
+    });
+    if (!res.ok) throw new Error('speech request failed');
+    buffer = await decodeAudio(ctx, await res.arrayBuffer());
+    audioCache.set(key, buffer);
+  }
+
+  playBuffer(ctx, buffer);
+}
+
+async function speak(text, lang, button) {
+  if (!text) return;
+  const ctx = ensureAudioContext();
+  button.classList.add('loading');
+
+  try {
+    if (!ctx) throw new Error('Web Audio unavailable');
+    await speakViaServer(ctx, text, lang);
+  } catch (err) {
+    // Offline, or the speech service is unhappy: the device voice is quieter
+    // but better than silence.
+    speakWithDeviceVoice(text, lang === 'ja' ? 'ja-JP' : 'en-US');
+  } finally {
+    button.classList.remove('loading');
+  }
+}
+
+speakEnBtn.addEventListener('click', () => speak(currentEn, 'en', speakEnBtn));
+speakJaBtn.addEventListener('click', () => speak(currentJa, 'ja', speakJaBtn));
 
 const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
 

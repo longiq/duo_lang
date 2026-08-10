@@ -10,9 +10,23 @@ Google Dịch chỉ dịch theo từng cặp ngôn ngữ (Việt↔Anh hoặc Vi
 
 ## Kiến trúc
 
-- **Frontend** (`public/`): HTML/CSS/JS thuần, không cần build. Dùng `SpeechRecognition` (Web Speech API) của trình duyệt để STT tiếng Việt, và `speechSynthesis` để TTS đọc tiếng Anh/Nhật.
-- **Backend** (`server/`): server Express nhỏ, nhận câu tiếng Việt, gọi Gemini API để dịch song song sang Anh + Nhật, trả JSON. API key được giữ ở server, **không lộ ra trình duyệt**.
+- **Frontend** (`public/`): HTML/CSS/JS thuần, không cần build. Dùng `SpeechRecognition` (Web Speech API) của trình duyệt để STT tiếng Việt. Phần đọc lại dùng audio do server tạo, phát qua Web Audio API.
+- **Backend** (`server/`): server Express nhỏ. API key được giữ ở server, **không lộ ra trình duyệt**.
+  - `POST /api/translate` — nhận câu tiếng Việt, gọi Gemini dịch song song sang Anh + Nhật, trả JSON.
+  - `POST /api/tts` — gọi Gemini TTS, bọc PCM thô trả về thành WAV (browser không decode được PCM không container), trả `audio/wav`. Có cache LRU trong RAM nên đọc lại cùng câu không tốn thêm quota.
 - **PWA**: `manifest.json` + `sw.js` (service worker) để cài được lên điện thoại và cache tài nguyên tĩnh.
+
+### Vì sao TTS chạy qua server thay vì `speechSynthesis`
+
+Trên iOS, `speechSynthesis` phát ra âm lượng thấp hơn hẳn khả năng của máy, và `volume` bị chặn ở mức 1 — không có cách nào làm to hơn bằng code. Audio từ server đi qua Web Audio cho phép **gain vượt mức 1**: clip được normalize lên gần đỉnh rồi qua compressor và một tầng make-up gain, nên nghe to hơn rõ rệt. Nếu request thất bại (mất mạng, hết quota), app tự lùi về giọng máy — nhỏ hơn nhưng vẫn nghe được.
+
+## Test
+
+```bash
+npm test
+```
+
+Chạy `test/stt.test.js` — không cần dependency ngoài. Nó dựng DOM + `SpeechRecognition` + Web Audio giả để kiểm tra các trường hợp đã từng gây lỗi thật: recognition kết thúc mà không có kết quả `isFinal`, iOS chọn giọng nhân vật (Grandpa/Fred), và luồng TTS qua server.
 
 ## Cài đặt & chạy
 
