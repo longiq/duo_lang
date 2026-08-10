@@ -148,12 +148,28 @@ systemctl is-active duolang
 log "nginx"
 if [ -d /etc/nginx/sites-available ]; then
   site=/etc/nginx/sites-available/duolang
-  sed "s/YOUR_DOMAIN/$DOMAIN/" "$APP_DIR/deploy/nginx.conf" >"$site"
-  ln -sfn "$site" /etc/nginx/sites-enabled/duolang
+  link=/etc/nginx/sites-enabled/duolang
 else
   # Oracle Linux nginx has no sites-available; use conf.d instead.
-  sed "s/YOUR_DOMAIN/$DOMAIN/" "$APP_DIR/deploy/nginx.conf" >/etc/nginx/conf.d/duolang.conf
+  site=/etc/nginx/conf.d/duolang.conf
+  link=""
 fi
+
+# Never clobber an existing config: certbot rewrites it in place to add the TLS
+# listener, so overwriting with the plain-HTTP template would silently take
+# HTTPS down on every re-run.
+if [ -f "$site" ]; then
+  echo "$site already exists, leaving untouched"
+  if ! diff -q <(sed "s/YOUR_DOMAIN/$DOMAIN/" "$APP_DIR/deploy/nginx.conf") "$site" >/dev/null 2>&1; then
+    echo "note: it differs from deploy/nginx.conf (expected once certbot has edited it)."
+    echo "      To adopt template changes: back up $site, delete it, re-run this script,"
+    echo "      then re-run certbot to restore TLS."
+  fi
+else
+  sed "s/YOUR_DOMAIN/$DOMAIN/" "$APP_DIR/deploy/nginx.conf" >"$site"
+  echo "wrote $site"
+fi
+[ -n "$link" ] && ln -sfn "$site" "$link"
 nginx -t
 systemctl enable nginx >/dev/null 2>&1 || true
 systemctl reload nginx 2>/dev/null || systemctl start nginx
