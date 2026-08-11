@@ -9,10 +9,16 @@ const PORT = process.env.PORT || 3000;
 // so the app itself never needs to be exposed. Set HOST=0.0.0.0 for containers.
 const HOST = process.env.HOST || '127.0.0.1';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// Pinned rather than gemini-flash-latest so the model can't change underneath
+// A flash-lite model, pinned rather than an alias so it can't change underneath
 // us. Check https://ai.google.dev/gemini-api/docs/models when bumping: retired
 // models don't 404, they report a free-tier quota of 0.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+//
+// Not the full flash model: measured on ten sentences it spent 449-871 thinking
+// tokens to produce ~35 tokens of translation, taking ~4.9s a call and
+// exhausting its free quota after six of them. flash-lite does no thinking,
+// answers in about a second, and produced translations that were equivalent or
+// slightly better.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 // Each TTS model carries its own free-tier allowance of only 10 requests per
 // day, so exhausting one falls through to the next rather than failing.
 const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
