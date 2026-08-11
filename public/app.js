@@ -1,24 +1,24 @@
 const LANGS = {
   vi: {
-    label: 'Tiếng Việt',
+    label: '🇻🇳 Tiếng Việt',
     bcp47: 'vi-VN',
-    prompt: 'Nhấn để nói tiếng Việt',
-    sourcePlaceholder: 'Câu của bạn',
-    targetPlaceholder: '—',
+    prompt: 'Bấm micro và nói tiếng Việt',
+    sourcePlaceholder: 'Câu bạn nói sẽ hiện ở đây, sửa được...',
+    targetPlaceholder: 'Bản dịch tiếng Việt sẽ hiện ở đây...',
   },
   en: {
-    label: 'English',
+    label: '🇬🇧 English',
     bcp47: 'en-US',
-    prompt: 'Nhấn để nói tiếng Anh',
-    sourcePlaceholder: 'Your sentence',
-    targetPlaceholder: '—',
+    prompt: 'Bấm micro và nói tiếng Anh',
+    sourcePlaceholder: 'Your sentence appears here, editable...',
+    targetPlaceholder: 'Bản dịch tiếng Anh sẽ hiện ở đây...',
   },
   ja: {
-    label: '日本語',
+    label: '🇯🇵 日本語',
     bcp47: 'ja-JP',
-    prompt: 'Nhấn để nói tiếng Nhật',
-    sourcePlaceholder: 'あなたの文',
-    targetPlaceholder: '—',
+    prompt: 'Bấm micro và nói tiếng Nhật',
+    sourcePlaceholder: '話した文がここに表示されます...',
+    targetPlaceholder: '日本語の翻訳がここに表示されます...',
   },
 };
 // Fixed order so the two target panes never swap position unexpectedly.
@@ -97,16 +97,10 @@ function applySourceLang(lang, { keepText = false } = {}) {
     pane.lang = targetLangs[i];
     pane.label.textContent = LANGS[pane.lang].label;
     pane.speak.setAttribute('aria-label', `Nghe ${LANGS[pane.lang].label}`);
-    // Drives the per-script typography, and tells a screen reader which
-    // language it is about to read out.
-    pane.label.setAttribute('lang', pane.lang);
-    pane.text.setAttribute('lang', pane.lang);
   });
 
   sourceInput.placeholder = LANGS[lang].sourcePlaceholder;
-  sourceInput.setAttribute('lang', lang);
-  // States the routing rather than describing the app.
-  subtitle.textContent = `${LANGS[lang].label} → ${targetLangs.map((l) => LANGS[l].label).join(' · ')}`;
+  subtitle.textContent = `Nói ${LANGS[lang].label.replace(/^\S+\s/, '')} → dịch cùng lúc sang 2 ngôn ngữ còn lại`;
   micStatus.textContent = idlePrompt();
 
   if (!keepText) sourceInput.value = '';

@@ -3,83 +3,78 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>DuoLang</title>
-  <meta name="theme-color" content="#eaece9" media="(prefers-color-scheme: light)" />
-  <meta name="theme-color" content="#14161a" media="(prefers-color-scheme: dark)" />
+  <title>DuoLang - Dịch song ngữ Anh/Nhật</title>
+  <meta name="theme-color" content="#1a1b2e" />
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" href="icons/icon-192.png" />
   <!-- iOS ignores most of the manifest, so the standalone behaviour, home
        screen name, status bar style and icon all have to be declared here. -->
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="DuoLang" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="mobile-web-app-capable" content="yes" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <main class="sheet">
-    <header class="masthead">
-      <span class="wordmark">DuoLang</span>
-      <!-- States the routing rather than selling the app. JS keeps it in sync
-           with whichever language you are speaking. -->
-      <span class="routing" id="subtitle"></span>
+  <main class="app">
+    <header class="app-header">
+      <h1>DuoLang</h1>
+      <p class="subtitle" id="subtitle">Nói tiếng Việt &rarr; dịch cùng lúc sang Anh &amp; Nhật</p>
     </header>
 
-    <section class="say">
-      <div class="switch" id="langSwitch" role="group" aria-label="Ngôn ngữ bạn nói">
-        <!-- Names what the row controls: without it the language names read the
-             same as the pane headings below and look like labels, not choices. -->
-        <span class="switch-label" aria-hidden="true">Nói</span>
-        <button type="button" class="lang-btn" data-lang="vi">Tiếng Việt</button>
-        <button type="button" class="lang-btn" data-lang="en">English</button>
-        <button type="button" class="lang-btn" data-lang="ja">日本語</button>
+    <section class="card source-card">
+      <div class="lang-switch" id="langSwitch" role="group" aria-label="Ngôn ngữ nói">
+        <button type="button" class="lang-btn" data-lang="vi">🇻🇳 Việt</button>
+        <button type="button" class="lang-btn" data-lang="en">🇬🇧 English</button>
+        <button type="button" class="lang-btn" data-lang="ja">🇯🇵 日本語</button>
       </div>
-      <!-- One row: autoGrow expands it as text arrives. -->
-      <textarea id="sourceText" class="said" rows="1"
+      <!-- One row: autoGrow expands it as text arrives. Two rows left the card
+           taller than the other two while empty. -->
+      <textarea id="sourceText" class="text-content source-input" rows="1"
                 autocomplete="off" autocapitalize="sentences" spellcheck="false"
-                aria-label="Câu bạn vừa nói, sửa được"></textarea>
+                aria-label="Câu nguồn, có thể sửa"></textarea>
     </section>
 
-    <!-- The two panes below are what a stranger reads off the screen, so they
-         carry the largest type on the page. -->
-    <section class="pane" id="targetCard0">
-      <div class="pane-head">
-        <h2 class="tongue" id="targetLabel0"></h2>
-        <button class="hear" id="speakBtn0" aria-label="Nghe bản dịch thứ nhất" disabled>
-          <span class="hear-mark" aria-hidden="true"></span>Nghe
+    <section class="card" id="targetCard0">
+      <div class="card-label-row">
+        <div class="card-label" id="targetLabel0"></div>
+        <button class="speak-btn" id="speakBtn0" aria-label="Nghe bản dịch thứ nhất" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="targetText0" class="phrase placeholder"></p>
+      <p id="targetText0" class="text-content placeholder"></p>
     </section>
 
-    <section class="pane" id="targetCard1">
-      <div class="pane-head">
-        <h2 class="tongue" id="targetLabel1"></h2>
-        <button class="hear" id="speakBtn1" aria-label="Nghe bản dịch thứ hai" disabled>
-          <span class="hear-mark" aria-hidden="true"></span>Nghe
+    <section class="card" id="targetCard1">
+      <div class="card-label-row">
+        <div class="card-label" id="targetLabel1"></div>
+        <button class="speak-btn" id="speakBtn1" aria-label="Nghe bản dịch thứ hai" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="targetText1" class="phrase placeholder"></p>
+      <p id="targetText1" class="text-content placeholder"></p>
     </section>
 
-    <p id="errorMsg" class="notice" hidden></p>
+    <p id="errorMsg" class="error-msg" hidden></p>
   </main>
 
-  <div class="deck">
-    <div class="deck-inner">
-      <p id="micStatus" class="cue"></p>
-      <div class="deck-row">
-        <span class="deck-slot"></span>
-        <button id="micBtn" class="capture" aria-label="Nhấn để nói">
-          <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor" aria-hidden="true">
+  <!-- Fixed to the bottom so the mic sits under the thumb rather than at the
+       top of a page that scrolls. -->
+  <div class="mic-bar">
+    <div class="mic-bar-inner">
+      <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
+      <div class="mic-row">
+        <span class="mic-slot"></span>
+        <button id="micBtn" class="mic-btn" aria-label="Bấm để nói">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor">
             <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
             <path d="M19 11a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V22h2v-2.06A9 9 0 0 0 21 11h-2z"/>
           </svg>
         </button>
-        <span class="deck-slot">
-          <button type="button" id="retranslateBtn" class="again" disabled>Dịch lại</button>
+        <span class="mic-slot">
+          <button type="button" id="retranslateBtn" class="retranslate-btn" disabled>Dịch lại</button>
         </span>
       </div>
     </div>
