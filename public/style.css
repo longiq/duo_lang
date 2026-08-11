@@ -23,7 +23,8 @@ body {
      keeps the header out from under the clock and notch. */
   padding-top: max(24px, env(safe-area-inset-top));
   padding-right: max(16px, env(safe-area-inset-right));
-  padding-bottom: max(48px, env(safe-area-inset-bottom));
+  /* Clears the fixed mic bar so the last card is never trapped underneath it. */
+  padding-bottom: calc(132px + env(safe-area-inset-bottom));
   padding-left: max(16px, env(safe-area-inset-left));
 }
 
@@ -44,16 +45,45 @@ body {
   font-size: 14px;
 }
 
-.mic-section {
-  display: flex;
-  flex-direction: column;
+/* Pinned to the bottom edge: the mic is the most-used control, so it belongs
+   under the thumb, not above a list that scrolls away. */
+.mic-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(20, 21, 42, 0.94);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-top: 1px solid #2b2d4d;
+  padding-bottom: env(safe-area-inset-bottom);
+  z-index: 10;
+}
+
+.mic-bar-inner {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 8px 16px 12px;
+}
+
+/* Three columns of equal outer width keep the mic optically centred even with
+   a button sitting to one side of it. */
+.mic-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  margin: 24px 0 32px;
+}
+
+.mic-slot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .mic-btn {
-  width: 84px;
-  height: 84px;
+  width: 72px;
+  height: 72px;
   border-radius: 50%;
   border: none;
   background: linear-gradient(135deg, #6c5ce7, #4834d4);
@@ -83,10 +113,11 @@ body {
 }
 
 .mic-status {
-  margin-top: 12px;
-  font-size: 14px;
+  margin: 0 0 6px;
+  font-size: 13px;
   color: #a0a3c0;
   text-align: center;
+  min-height: 18px;
 }
 
 .card {
@@ -136,17 +167,23 @@ body {
 }
 
 .lang-btn {
-  flex: 1;
+  /* flex-basis 0 with min-width 0: without both, a nowrap label sets a minimum
+     size the item refuses to shrink below, which pushed the whole page wider
+     than the viewport. */
+  flex: 1 1 0;
+  min-width: 0;
   border: none;
   background: transparent;
   color: #a0a3c0;
   font-size: 13px;
   font-weight: 600;
   font-family: inherit;
-  padding: 7px 4px;
+  padding: 7px 2px;
   border-radius: 8px;
   cursor: pointer;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .lang-btn.active {
@@ -160,6 +197,8 @@ body {
   margin: 0;
   background: transparent;
   border: none;
+  /* A dashed underline is the only affordance signalling the field is editable,
+     now that the hint text is gone. */
   border-bottom: 1px dashed #3d3f66;
   color: inherit;
   font: inherit;
@@ -183,19 +222,6 @@ body {
   font-size: 15px;
 }
 
-.source-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 10px;
-}
-
-.source-hint {
-  font-size: 12px;
-  color: #6b6e8f;
-}
-
 .retranslate-btn {
   border: 1px solid #4b4e7a;
   background: #2b2d4d;
@@ -203,7 +229,7 @@ body {
   font-family: inherit;
   font-size: 13px;
   font-weight: 600;
-  padding: 7px 14px;
+  padding: 8px 12px;
   border-radius: 8px;
   cursor: pointer;
   flex-shrink: 0;

@@ -24,16 +24,6 @@
       <p class="subtitle" id="subtitle">Nói tiếng Việt &rarr; dịch cùng lúc sang Anh &amp; Nhật</p>
     </header>
 
-    <section class="mic-section">
-      <button id="micBtn" class="mic-btn" aria-label="Bấm để nói">
-        <svg viewBox="0 0 24 24" width="36" height="36" fill="currentColor">
-          <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
-          <path d="M19 11a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V22h2v-2.06A9 9 0 0 0 21 11h-2z"/>
-        </svg>
-      </button>
-      <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
-    </section>
-
     <section class="card source-card">
       <div class="lang-switch" id="langSwitch" role="group" aria-label="Ngôn ngữ nói">
         <button type="button" class="lang-btn" data-lang="vi">🇻🇳 Việt</button>
@@ -43,10 +33,6 @@
       <textarea id="sourceText" class="text-content source-input" rows="2"
                 autocomplete="off" autocapitalize="sentences" spellcheck="false"
                 aria-label="Câu nguồn, có thể sửa"></textarea>
-      <div class="source-actions">
-        <span class="source-hint" id="sourceHint">Sửa được nếu nhận diện sai</span>
-        <button type="button" id="retranslateBtn" class="retranslate-btn" disabled>Dịch lại</button>
-      </div>
     </section>
 
     <section class="card" id="targetCard0">
@@ -71,6 +57,26 @@
 
     <p id="errorMsg" class="error-msg" hidden></p>
   </main>
+
+  <!-- Fixed to the bottom so the mic sits under the thumb rather than at the
+       top of a page that scrolls. -->
+  <div class="mic-bar">
+    <div class="mic-bar-inner">
+      <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
+      <div class="mic-row">
+        <span class="mic-slot"></span>
+        <button id="micBtn" class="mic-btn" aria-label="Bấm để nói">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor">
+            <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
+            <path d="M19 11a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V22h2v-2.06A9 9 0 0 0 21 11h-2z"/>
+          </svg>
+        </button>
+        <span class="mic-slot">
+          <button type="button" id="retranslateBtn" class="retranslate-btn" disabled>Dịch lại</button>
+        </span>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
