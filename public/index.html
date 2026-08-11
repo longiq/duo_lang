@@ -30,7 +30,9 @@
         <button type="button" class="lang-btn" data-lang="en">🇬🇧 English</button>
         <button type="button" class="lang-btn" data-lang="ja">🇯🇵 日本語</button>
       </div>
-      <textarea id="sourceText" class="text-content source-input" rows="2"
+      <!-- One row: autoGrow expands it as text arrives. Two rows left the card
+           taller than the other two while empty. -->
+      <textarea id="sourceText" class="text-content source-input" rows="1"
                 autocomplete="off" autocapitalize="sentences" spellcheck="false"
                 aria-label="Câu nguồn, có thể sửa"></textarea>
     </section>
