@@ -19,6 +19,9 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // answers in about a second, and produced translations that were equivalent or
 // slightly better.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+// Overridable so tests can point at a local stand-in instead of spending quota.
+const GEMINI_ENDPOINT_BASE = process.env.GEMINI_ENDPOINT_BASE ||
+  'https://generativelanguage.googleapis.com/v1beta/models';
 // Each TTS model carries its own free-tier allowance of only 10 requests per
 // day, so exhausting one falls through to the next rather than failing.
 const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
@@ -72,6 +75,90 @@ const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
+// --- translation ------------------------------------------------------------
+// Cached per source/target/sentence rather than per pair, so switching which
+// language you speak still reuses whatever has already been translated.
+const translateCache = new Map();
+const TRANSLATE_CACHE_MAX = 300;
+
+function lruGet(cache, key) {
+  if (!cache.has(key)) return null;
+  const value = cache.get(key);
+  cache.delete(key);
+  cache.set(key, value); // reinsert to mark it recent
+  return value;
+}
+
+function lruSet(cache, key, value, max) {
+  cache.set(key, value);
+  while (cache.size > max) cache.delete(cache.keys().next().value);
+}
+
+// Every target still comes back from a single call, as before -- splitting them
+// into one call per language would have doubled quota use. Caching is per
+// language only so that a target already translated is not asked for again:
+// with both cached there is no call at all, with one cached the call asks for
+// just the other.
+async function translateBatch(text, source, targets) {
+  const translations = {};
+  const missing = [];
+
+  for (const target of targets) {
+    const hit = lruGet(translateCache, `${source}|${target}|${text}`);
+    if (hit) translations[target] = hit;
+    else missing.push(target);
+  }
+
+  if (!missing.length) return { translations, cached: true };
+
+  const targetList = missing.map((t) => LANG_NAMES[t]).join(' and ');
+  const shape = `{${missing.map((t) => `"${t}": "..."`).join(', ')}}`;
+  const prompt = `You are a professional translator.
+Translate the following ${LANG_NAMES[source]} sentence into natural, fluent ${targetList}.
+Keep the original meaning, tone and level of politeness. Do not add explanations.
+Respond ONLY with valid JSON in this exact shape: ${shape}
+
+${LANG_NAMES[source]} sentence: "${text}"`;
+
+  const url = `${GEMINI_ENDPOINT_BASE}/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error('Gemini translate error:', response.status, body.slice(0, 300));
+    const err = new Error(`translate ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const data = await response.json();
+  const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!raw) throw new Error('empty translation response');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('unparseable translation response');
+  }
+
+  for (const target of missing) {
+    const value = typeof parsed[target] === 'string' ? parsed[target].trim() : '';
+    if (!value) throw new Error(`malformed translation for ${target}`);
+    translations[target] = value;
+    lruSet(translateCache, `${source}|${target}|${text}`, value, TRANSLATE_CACHE_MAX);
+  }
+
+  return { translations, cached: false };
+}
+
 app.post('/api/translate', async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   if (!text) {
@@ -98,62 +185,19 @@ app.post('/api/translate', async (req, res) => {
     return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
   }
 
-  const targetList = targets.map((t) => LANG_NAMES[t]).join(' and ');
-  const shape = `{${targets.map((t) => `"${t}": "..."`).join(', ')}}`;
-  const prompt = `You are a professional translator.
-Translate the following ${LANG_NAMES[source]} sentence into natural, fluent ${targetList}.
-Keep the original meaning, tone and level of politeness. Do not add explanations.
-Respond ONLY with valid JSON in this exact shape: ${shape}
-
-${LANG_NAMES[source]} sentence: "${text}"`;
-
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.2
-        }
-      })
-    });
-
-    if (!geminiRes.ok) {
-      const errBody = await geminiRes.text();
-      console.error('Gemini API error:', geminiRes.status, errBody);
-      return res.status(502).json({ error: 'Translation service error.' });
-    }
-
-    const data = await geminiRes.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) {
-      return res.status(502).json({ error: 'Empty response from translation service.' });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return res.status(502).json({ error: 'Could not parse translation result.' });
-    }
-
-    const translations = {};
-    for (const target of targets) {
-      if (typeof parsed[target] !== 'string' || !parsed[target].trim()) {
-        return res.status(502).json({ error: 'Malformed translation result.' });
-      }
-      translations[target] = parsed[target].trim();
-    }
-
+    const { translations, cached } = await translateBatch(text, source, targets);
+    res.set('X-Cache', cached ? 'hit' : 'miss');
     // Spread as well as nest so a client cached before this change, which read
     // data.en / data.ja directly, keeps working.
     res.json({ source, translations, ...translations });
   } catch (err) {
-    console.error('Translate request failed:', err);
-    res.status(500).json({ error: 'Internal server error.' });
+    console.error('Translate request failed:', err.message);
+    res.status(err.status === 429 ? 429 : 502).json({
+      error: err.status === 429
+        ? 'Hết hạn mức dịch, thử lại sau một lát.'
+        : 'Translation service error.',
+    });
   }
 });
 
@@ -319,7 +363,7 @@ async function synthesiseWithGemini(text, lang) {
 
   // Each model has its own daily allowance, so a 429 moves to the next one.
   for (const model of GEMINI_TTS_MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `${GEMINI_ENDPOINT_BASE}/${model}:generateContent?key=${GEMINI_API_KEY}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

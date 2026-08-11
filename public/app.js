@@ -111,9 +111,39 @@ function applySourceLang(lang, { keepText = false } = {}) {
   try { localStorage.setItem(SOURCE_STORAGE_KEY, lang); } catch (err) { /* private mode */ }
 }
 
+// Keyed per language so a sentence already translated is shown without a
+// round trip -- repeating yourself, or tapping retranslate, costs nothing.
+const translationCache = new Map();
+
+function showTranslations(result) {
+  translations = {};
+  targetPanes.forEach((pane) => {
+    const value = result[pane.lang];
+    translations[pane.lang] = value;
+    setText(pane.text, value, false);
+    pane.speak.disabled = !value;
+  });
+}
+
 async function translate(text) {
-  micStatus.textContent = 'Đang dịch...';
   clearError();
+
+  const cached = {};
+  const allCached = targetLangs.every((lang) => {
+    const hit = translationCache.get(`${sourceLang}|${lang}|${text}`);
+    if (hit) cached[lang] = hit;
+    return Boolean(hit);
+  });
+
+  if (allCached) {
+    showTranslations(cached);
+    lastTranslatedText = text;
+    micStatus.textContent = idlePrompt();
+    refreshRetranslateState();
+    return;
+  }
+
+  micStatus.textContent = 'Đang dịch...';
   try {
     const res = await fetch('/api/translate', {
       method: 'POST',
@@ -126,13 +156,10 @@ async function translate(text) {
     }
 
     const result = data.translations || data;
-    translations = {};
-    targetPanes.forEach((pane) => {
-      const value = result[pane.lang];
-      translations[pane.lang] = value;
-      setText(pane.text, value, false);
-      pane.speak.disabled = !value;
+    targetLangs.forEach((lang) => {
+      if (result[lang]) translationCache.set(`${sourceLang}|${lang}|${text}`, result[lang]);
     });
+    showTranslations(result);
     lastTranslatedText = text;
     micStatus.textContent = idlePrompt();
   } catch (err) {

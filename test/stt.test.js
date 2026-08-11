@@ -327,6 +327,51 @@ async function editingSourceText() {
   check('retranslate disabled again afterwards', els.retranslateBtn.disabled === true);
 }
 
+async function repeatedSentenceIsNotRefetched() {
+  console.log('\n# a sentence already translated is shown without a round trip');
+  const { els, fetchCalls, state } = loadApp();
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  const first = fetchCalls.filter((c) => c.url === '/api/translate').length;
+  check('translated once', first === 1, `calls: ${first}`);
+
+  // Say the same thing again.
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  const after = fetchCalls.filter((c) => c.url === '/api/translate').length;
+  check('no second request for the same sentence', after === first, `${first} -> ${after}`);
+  check('panes still filled from cache', els.targetText0.textContent === 'Hello there',
+        `got "${els.targetText0.textContent}"`);
+  check('speak buttons re-enabled', !els.speakBtn0.disabled && !els.speakBtn1.disabled);
+  check('status back to idle', els.micStatus.textContent !== 'Đang dịch...', els.micStatus.textContent);
+}
+
+async function switchingSourceRefetches() {
+  console.log('\n# the cache is per language pair, not per sentence alone');
+  const { els, fetchCalls, state, langButtons } = loadApp();
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+  const before = fetchCalls.filter((c) => c.url === '/api/translate').length;
+
+  // Same text, but now treated as English rather than Vietnamese.
+  els.langSwitch._fire('click', { target: langButtons[1] });
+  els.sourceText.value = 'xin chào bạn';
+  els.sourceText._fire('input');
+  els.retranslateBtn._fire('click');
+  await tick();
+
+  const after = fetchCalls.filter((c) => c.url === '/api/translate').length;
+  check('refetched for the new source language', after === before + 1, `${before} -> ${after}`);
+  const last = fetchCalls.filter((c) => c.url === '/api/translate').pop();
+  check('asked with the new source', last.body.source === 'en', JSON.stringify(last.body));
+}
+
 async function ttsPicksBestVoiceAndGain() {
   console.log('\n# TTS: best device voice as fallback, real gain on the server path');
   const audio = newAudioRecord();
@@ -424,6 +469,8 @@ async function withoutWebAudioUsesDeviceVoice() {
   await switchingSourceLanguage();
   await restoresStoredSourceLanguage();
   await editingSourceText();
+  await repeatedSentenceIsNotRefetched();
+  await switchingSourceRefetches();
   await ttsPicksBestVoiceAndGain();
   await ttsCachesPerSentence();
   await quotaExhaustedFallsBack();
