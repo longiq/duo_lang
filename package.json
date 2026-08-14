@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node test/unit.test.js && node test/stt.test.js && node test/translate.test.js && node test/translate-errors.test.js && node test/tts-gemini.test.js && node test/budget.test.js && node test/limits.test.js",
+    "test": "node test/unit.test.js && node test/stt.test.js && node test/translate.test.js && node test/translate-errors.test.js && node test/translate-daily.test.js && node test/tts-gemini.test.js && node test/budget.test.js && node test/limits.test.js",
     "icons": "node tools/make-icons.js"
   },
   "dependencies": {

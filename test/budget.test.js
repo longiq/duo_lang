@@ -16,8 +16,10 @@ const usageFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'duolang-')), 
 
 // A local stand-in for texttospeech.googleapis.com so no real quota is spent.
 // `quotaOut` names tiers it should answer with 429, imitating Google's own
-// per-tier quota running out before our cap does.
-function startFakeGoogle(quotaOut = new Set()) {
+// per-tier quota running out before our cap does. `delayMs` holds the response
+// open, which is what actually gives a race between two concurrent requests
+// something to race during -- see concurrentRequestsDoNotOvershootBudget().
+function startFakeGoogle(quotaOut = new Set(), delayMs = 0) {
   const http = require('http');
   return new Promise((resolve) => {
     const voicesAsked = [];
@@ -27,18 +29,22 @@ function startFakeGoogle(quotaOut = new Set()) {
       req.on('end', () => {
         const voice = (JSON.parse(body || '{}').voice || {}).name || '';
         voicesAsked.push(voice);
-        const tier = [...quotaOut].find((t) => voice.includes(t));
-        if (tier) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { code: 429, message: `Quota exceeded for ${tier}` } }));
-          return;
-        }
-        // 44-byte WAV header plus a little silence, enough to look like audio.
-        const wav = Buffer.alloc(64);
-        wav.write('RIFF', 0, 'ascii');
-        wav.write('WAVE', 8, 'ascii');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ audioContent: wav.toString('base64') }));
+        const respond = () => {
+          const tier = [...quotaOut].find((t) => voice.includes(t));
+          if (tier) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { code: 429, message: `Quota exceeded for ${tier}` } }));
+            return;
+          }
+          // 44-byte WAV header plus a little silence, enough to look like audio.
+          const wav = Buffer.alloc(64);
+          wav.write('RIFF', 0, 'ascii');
+          wav.write('WAVE', 8, 'ascii');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ audioContent: wav.toString('base64') }));
+        };
+        if (delayMs) setTimeout(respond, delayMs);
+        else respond();
       });
     });
     server.listen(0, '127.0.0.1', () => resolve({
@@ -199,10 +205,44 @@ async function overallCeiling() {
 
 const totalOf = (u) => u.totalUsed;
 
+// pickTier() used to run before the upstream await and recordUsage() only
+// after it returned, with no lock between them: two requests arriving close
+// together could both see room in the same tier and both spend it, together
+// overshooting the budget. reserveTtsTier() (server/index.js) closes that gap
+// by charging synchronously, before any await -- this test fails against the
+// old pickTier()/recordUsage() pair and passes against the fix.
+async function concurrentRequestsDoNotOvershootBudget() {
+  console.log('\n# two concurrent requests cannot both spend the same last slice of budget');
+  fs.rmSync(usageFile, { force: true });
+  // Delayed response widens the window the old code would have raced in.
+  const fake = await startFakeGoogle(new Set(), 50);
+  // Exactly one request's worth of budget -- room for one winner, not two.
+  const child = startServer(fake, { TTS_TIER_ORDER: 'Chirp3-HD', TTS_BUDGET_CHIRP3_HD: '10' });
+  await waitForServer();
+
+  try {
+    // Distinct text (distinct cache keys), same length, fired together.
+    const [a, b] = await Promise.all([tts('aaaaaaaaaa'), tts('bbbbbbbbbb')]);
+    const statuses = [a.status, b.status].sort();
+    check('exactly one of the two succeeds', statuses[0] === 200 && statuses[1] === 429,
+          `statuses: ${statuses.join(',')}`);
+
+    const u = await usage();
+    check('total usage never exceeds the budget', totalOf(u) <= 10, `total: ${totalOf(u)}`);
+    check('usage matches exactly one charge, not a partial or double one', totalOf(u) === 10,
+          `total: ${totalOf(u)}`);
+  } finally {
+    child.kill();
+    fake.server.close();
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function main() {
   await budgetCascade();
   await googleQuotaCascade();
   await overallCeiling();
+  await concurrentRequestsDoNotOvershootBudget();
 
   finish();
 }

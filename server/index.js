@@ -42,6 +42,13 @@ const TTS_MAX_CHARS = 600;
 // Generous headroom over a spoken sentence, not a hard product limit -- this
 // exists so one request can't build an arbitrarily large translation prompt.
 const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 1000);
+// Cloud TTS is capped below because it costs money. This is capped because
+// the Gemini free tier is a fixed number of requests a day, and a public URL
+// with no auth means anyone who finds it can spend the day's worth before the
+// owner wakes up. Check the model's requests-per-day on the docs page cited
+// above before raising it.
+const TRANSLATE_DAILY_MAX = Number(process.env.TRANSLATE_DAILY_MAX || 400);
+const TRANSLATE_USAGE_FILE = process.env.TRANSLATE_USAGE_FILE || path.join(__dirname, '..', 'translate-usage.json');
 
 // Google Cloud Text-to-Speech, used in preference to Gemini when a key is
 // configured: its free tier is 1M characters a month rather than 10 requests a
@@ -182,12 +189,76 @@ function limit(name, capacity, perSec) {
 // PWA cold start that fetches several files at once.
 app.use('/api', limit('api', 60, 1));
 
+// --- daily translate budget --------------------------------------------------
+// Gemini's free-tier daily quota rolls over at midnight Pacific, not UTC --
+// keying this on a UTC day would open a window where the app refuses while
+// Google's own quota still has room, or the reverse. Falls back to a UTC day
+// key if the runtime's ICU data is incomplete (a Node build without full-icu).
+function currentDay() {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+  } catch (err) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+let translateUsage = readTranslateUsage();
+
+function readTranslateUsage() {
+  const day = currentDay();
+  try {
+    const saved = JSON.parse(fs.readFileSync(TRANSLATE_USAGE_FILE, 'utf8'));
+    if (saved && saved.day === day && typeof saved.count === 'number') {
+      return { day, count: saved.count };
+    }
+  } catch (err) {
+    // Missing, unreadable, or a new day: start the count at zero.
+  }
+  return { day, count: 0 };
+}
+
+function persistTranslateUsage() {
+  try {
+    // Temp file + rename rather than a direct write: a crash mid-write leaves
+    // the previous, complete file in place instead of truncated JSON, which
+    // readTranslateUsage()'s catch would otherwise treat as "no usage yet" and
+    // silently reset the day's count to zero.
+    const tmp = `${TRANSLATE_USAGE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(translateUsage));
+    fs.renameSync(tmp, TRANSLATE_USAGE_FILE);
+  } catch (err) {
+    console.error('Could not persist translate usage:', err.message);
+  }
+}
+
+// Always false today -- there is no access code and none is planned unless
+// abuse actually happens. This exists so that turning one on, if the public
+// URL ever gets hammered, is filling in this function's body (e.g. checking
+// an X-Access-Code header against process.env.ACCESS_CODE) rather than
+// restructuring reserveTranslateCall()'s caller under pressure.
+function isPrivileged(req) {
+  return false;
+}
+
+// Checks and charges the daily cap in one synchronous step, same reasoning as
+// reserveTtsTier() below: no await sits between the check and the charge, so
+// two requests racing each other cannot both see room and both spend it.
+function reserveTranslateCall(privileged) {
+  const day = currentDay();
+  if (translateUsage.day !== day) translateUsage = { day, count: 0 };
+  if (privileged) return true;
+  if (translateUsage.count >= TRANSLATE_DAILY_MAX) return false;
+  translateUsage.count += 1;
+  persistTranslateUsage();
+  return true;
+}
+
 // Every target still comes back from a single call, as before -- splitting them
 // into one call per language would have doubled quota use. Caching is per
 // language only so that a target already translated is not asked for again:
 // with both cached there is no call at all, with one cached the call asks for
 // just the other.
-async function translateBatch(text, source, targets) {
+async function translateBatch(text, source, targets, { privileged = false } = {}) {
   const translations = {};
   const missing = [];
 
@@ -198,6 +269,15 @@ async function translateBatch(text, source, targets) {
   }
 
   if (!missing.length) return { translations, cached: true };
+
+  // Charged only here, never for a fully-cached request above -- otherwise
+  // repeating a sentence (which the client already dedupes, but a hostile
+  // caller wouldn't) would burn the daily cap for free work.
+  if (!reserveTranslateCall(privileged)) {
+    const err = new Error('daily translate budget exhausted');
+    err.dailyLimitExceeded = true;
+    throw err;
+  }
 
   const targetList = missing.map((t) => LANG_NAMES[t]).join(' and ');
   const shape = `{${missing.map((t) => `"${t}": "..."`).join(', ')}}`;
@@ -286,13 +366,17 @@ app.post('/api/translate', limit('translate', 15, 0.15), async (req, res) => {
   }
 
   try {
-    const { translations, cached } = await translateBatch(text, source, targets);
+    const privileged = isPrivileged(req);
+    const { translations, cached } = await translateBatch(text, source, targets, { privileged });
     res.set('X-Cache', cached ? 'hit' : 'miss');
     // Spread as well as nest so a client cached before this change, which read
     // data.en / data.ja directly, keeps working.
     res.json({ source, translations, ...translations });
   } catch (err) {
     console.error('Translate request failed:', err.message);
+    if (err.dailyLimitExceeded) {
+      return res.status(429).json({ error: 'Đã dùng hết lượt dịch miễn phí hôm nay, thử lại vào ngày mai.' });
+    }
     res.status(err.status === 429 ? 429 : 502).json({
       error: err.status === 429
         ? 'Hết hạn mức dịch, thử lại sau một lát.'
@@ -338,24 +422,10 @@ function parseAudioMime(mimeType) {
 }
 
 // Synthesis is the expensive call, so keep recent clips to spend no quota when
-// the same sentence is replayed after a reload.
+// the same sentence is replayed after a reload. Same lruGet/lruSet as the
+// translate cache above -- this used to be its own byte-identical copy.
 const ttsCache = new Map();
 const TTS_CACHE_MAX = 40;
-
-function cacheGet(key) {
-  if (!ttsCache.has(key)) return null;
-  const value = ttsCache.get(key);
-  ttsCache.delete(key);
-  ttsCache.set(key, value); // reinsert to keep it recent
-  return value;
-}
-
-function cacheSet(key, value) {
-  ttsCache.set(key, value);
-  while (ttsCache.size > TTS_CACHE_MAX) {
-    ttsCache.delete(ttsCache.keys().next().value);
-  }
-}
 
 // --- monthly character budget ----------------------------------------------
 // Persisted so a restart cannot silently reset the allowance.
@@ -378,15 +448,32 @@ function readUsage() {
   return { period, tiers: {} };
 }
 
-function recordUsage(tier, chars) {
-  const usage = readUsage();
-  usage.tiers[tier] = (usage.tiers[tier] || 0) + chars;
+// In-memory mirror of tts-usage.json: the source of truth for the reserve/
+// refund pair below. Loaded once at startup and from then on kept in sync
+// with the file by a synchronous write inside reserveTtsTier()/refundTtsTier()
+// themselves -- never re-read from disk on the /api/tts hot path, which used
+// to block the single event loop on every request (readUsage() does a
+// readFileSync + JSON.parse). /api/tts/usage still reads this same object, so
+// it stays accurate without a disk read of its own.
+let liveTtsUsage = readUsage();
+
+function rollTtsUsagePeriod() {
+  const period = currentPeriod();
+  if (liveTtsUsage.period !== period) liveTtsUsage = { period, tiers: {} };
+}
+
+function persistTtsUsage() {
   try {
-    fs.writeFileSync(TTS_USAGE_FILE, JSON.stringify(usage));
+    // Temp file + rename rather than a direct write: a crash mid-write leaves
+    // the previous, complete file in place instead of truncated JSON, which
+    // readUsage()'s catch would otherwise treat as "no usage yet" and
+    // silently reset the month's spending to zero.
+    const tmp = `${TTS_USAGE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(liveTtsUsage));
+    fs.renameSync(tmp, TTS_USAGE_FILE);
   } catch (err) {
     console.error('Could not persist TTS usage:', err.message);
   }
-  return usage;
 }
 
 function totalUsed(usage) {
@@ -409,17 +496,31 @@ function markExhausted(tier) {
   exhaustedTiers.set(tier, currentPeriod());
 }
 
-// First tier with room for this text, working down from best quality.
-function pickTier(chars) {
-  const usage = readUsage();
-  if (TTS_MONTHLY_CHAR_LIMIT > 0 && totalUsed(usage) + chars > TTS_MONTHLY_CHAR_LIMIT) {
+// Picks the first tier with room, working down from best quality, AND charges
+// it in the same synchronous step -- no await sits between the check and the
+// charge, so two requests racing each other cannot both see room and both
+// spend it (the old pickTier()/recordUsage() pair bracketed the upstream
+// fetch, leaving exactly that gap). A failed synthesis call refunds via
+// refundTtsTier() below.
+function reserveTtsTier(chars) {
+  rollTtsUsagePeriod();
+  if (TTS_MONTHLY_CHAR_LIMIT > 0 && totalUsed(liveTtsUsage) + chars > TTS_MONTHLY_CHAR_LIMIT) {
     return null;
   }
   for (const tier of TTS_TIER_ORDER) {
     if (isExhausted(tier)) continue;
-    if (tierRemaining(tier, usage) >= chars) return tier;
+    if (tierRemaining(tier, liveTtsUsage) >= chars) {
+      liveTtsUsage.tiers[tier] = (liveTtsUsage.tiers[tier] || 0) + chars;
+      persistTtsUsage();
+      return tier;
+    }
   }
   return null;
+}
+
+function refundTtsTier(tier, chars) {
+  liveTtsUsage.tiers[tier] = Math.max(0, (liveTtsUsage.tiers[tier] || 0) - chars);
+  persistTtsUsage();
 }
 
 // --- synthesis providers ----------------------------------------------------
@@ -530,13 +631,13 @@ app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
   };
 
   // A cache hit costs nothing, so it is served before any budget check.
-  const cached = cacheGet(cacheKey);
+  const cached = lruGet(ttsCache, cacheKey);
   if (cached) return sendWav(cached, true);
 
   if (!useCloud) {
     try {
       const wav = await synthesiseWithGemini(text, lang);
-      cacheSet(cacheKey, wav);
+      lruSet(ttsCache, cacheKey, wav, TTS_CACHE_MAX);
       return sendWav(wav, false, 'gemini');
     } catch (err) {
       console.error('Gemini TTS failed:', err.message, err.body || '');
@@ -551,16 +652,18 @@ app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
   // spending rather than relying on Google-side configuration being right.
   let lastError = null;
   for (;;) {
-    const tier = pickTier(text.length);
+    const tier = reserveTtsTier(text.length);
     if (!tier) break;
 
     try {
       const wav = await synthesiseWithCloudTts(text, lang, tier);
-      recordUsage(tier, text.length);
-      cacheSet(cacheKey, wav);
+      lruSet(ttsCache, cacheKey, wav, TTS_CACHE_MAX);
       return sendWav(wav, false, tier);
     } catch (err) {
       lastError = err;
+      // Charged optimistically in reserveTtsTier() before this call, so any
+      // failure -- Google's own quota or anything else -- gives it back.
+      refundTtsTier(tier, text.length);
       if (err.status === 429) {
         // Google's own quota for this tier ran out before our cap did.
         console.warn(`TTS tier ${tier} hit Google's quota, trying the next tier`);
@@ -572,8 +675,7 @@ app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
     }
   }
 
-  const usage = readUsage();
-  console.warn(`TTS budget exhausted across all tiers: ${JSON.stringify(usage.tiers)}`);
+  console.warn(`TTS budget exhausted across all tiers: ${JSON.stringify(liveTtsUsage.tiers)}`);
   return res.status(429).json({
     error: 'Đã dùng hết hạn mức giọng đọc tháng này.',
     detail: lastError ? lastError.message : 'all tiers at budget',
@@ -583,7 +685,8 @@ app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
 // Lets the deploy see where the monthly allowance stands per tier without
 // digging through logs.
 app.get('/api/tts/usage', (req, res) => {
-  const usage = readUsage();
+  rollTtsUsagePeriod();
+  const usage = liveTtsUsage;
   const tiers = TTS_TIER_ORDER.map((tier) => ({
     tier,
     voiceExample: TIER_VOICES[tier].vi,
