@@ -4,6 +4,14 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+// 'loopback', not true: with true, Express trusts the leftmost X-Forwarded-For
+// entry, which is the one an attacker controls -- sending your own
+// "X-Forwarded-For: 1.2.3.4" would let every IP-keyed limit below be bypassed
+// with one header. With 'loopback', the socket peer (nginx, on 127.0.0.1) is
+// the only address trusted, so Express takes the *last* XFF entry instead --
+// the one nginx itself appended via $proxy_add_x_forwarded_for
+// (deploy/nginx.conf) -- and a spoofed prefix a client prepends is ignored.
+app.set('trust proxy', 'loopback');
 const PORT = process.env.PORT || 3000;
 // Bind to loopback by default: in the documented deployment nginx proxies to us,
 // so the app itself never needs to be exposed. Set HOST=0.0.0.0 for containers.
@@ -110,6 +118,70 @@ function lruSet(cache, key, value, max) {
   while (cache.size > max) cache.delete(cache.keys().next().value);
 }
 
+// --- per-client rate limiting ------------------------------------------------
+// A token bucket per client: two numbers, refilled lazily on access rather
+// than on a timer, so an idle client costs nothing and no interval runs on a
+// box with one CPU. Hand-rolled rather than express-rate-limit: this is less
+// code than that package's configuration surface, and it reuses the LRU above.
+//
+// nginx cannot do this job instead: limit_req_zone is only legal inside an
+// http{} block, and deploy/nginx.conf is a server{} block that
+// deploy/bootstrap.sh deliberately never overwrites once certbot has edited
+// it in place -- so a change there would not even reach the running box.
+const buckets = new Map();
+const BUCKET_MAX = 2000; // bounded on purpose: ~2000 entries of two numbers each
+
+function take(key, capacity, perSec) {
+  const now = Date.now();
+  const bucket = lruGet(buckets, key) || { tokens: capacity, last: now };
+  bucket.tokens = Math.min(capacity, bucket.tokens + ((now - bucket.last) / 1000) * perSec);
+  bucket.last = now;
+  lruSet(buckets, key, bucket, BUCKET_MAX);
+  if (bucket.tokens < 1) return Math.ceil((1 - bucket.tokens) / perSec); // seconds to wait
+  bucket.tokens -= 1;
+  return 0;
+}
+
+// One bucket per IPv4 address, but per /64 for IPv6: phones and VPS providers
+// hand a device a whole /64, so counting the single address would be free to
+// bypass by walking the host part of it.
+function clientKey(req) {
+  const ip = (req.ip || (req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+  return ip.includes(':') ? `${ip.split(':').slice(0, 4).join(':')}::` : ip;
+}
+
+// Known weaknesses, accepted rather than hidden: LRU eviction means a client
+// that rotates addresses can push another client's bucket out and reset it to
+// full, and per-IP limiting does nothing against a genuinely distributed
+// abuser. Neither is a reason to skip this -- it stops the realistic case (one
+// script, one address) -- it is the reason the daily translate budget exists
+// as the actual backstop (see TRANSLATE_DAILY_MAX below).
+//
+// `name` rather than req.path keys the bucket: the outer /api limiter and a
+// route's own limiter both run for the same request, and if both used
+// req.path they would silently share one bucket and fight over its capacity
+// (each take() call would re-cap the other's token count to its own, smaller,
+// capacity). A name makes each limiter's bucket independent regardless of
+// what else is mounted on the same path.
+function limit(name, capacity, perSec) {
+  return (req, res, next) => {
+    const wait = take(`${name}|${clientKey(req)}`, capacity, perSec);
+    if (!wait) return next();
+    res.set('Retry-After', String(wait));
+    res.status(429).json({ error: 'Bạn thao tác hơi nhanh, chờ một chút nhé.' });
+  };
+}
+
+// The outer limit means a flood of already-rejected requests still costs the
+// attacker something; the per-route limits below are the ones that matter day
+// to day. Numbers are chosen against real use: one /api/translate call per
+// spoken sentence, and the client already suppresses repeats of the same text
+// (app.js translationCache), so a fast real conversation sits well under the
+// sustained rate with a burst of capacity in hand. Static assets are left
+// unlimited -- they cost CPU but no quota, and limiting them risks breaking a
+// PWA cold start that fetches several files at once.
+app.use('/api', limit('api', 60, 1));
+
 // Every target still comes back from a single call, as before -- splitting them
 // into one call per language would have doubled quota use. Caching is per
 // language only so that a target already translated is not asked for again:
@@ -178,7 +250,8 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
   return { translations, cached: false };
 }
 
-app.post('/api/translate', async (req, res) => {
+// ~9/min sustained, burst of 15 in hand -- see the rate-limiting comment above.
+app.post('/api/translate', limit('translate', 15, 0.15), async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   if (!text) {
     return res.status(400).json({ error: 'Thiếu nội dung cần dịch.' });
@@ -423,7 +496,9 @@ async function synthesiseWithGemini(text, lang) {
   throw lastErr || new Error('Gemini TTS failed');
 }
 
-app.post('/api/tts', async (req, res) => {
+// Two plays per translation is the common case, and replays are served from
+// cache client-side (app.js audioCache), so this can be looser than translate.
+app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   const lang = (req.body && req.body.lang || '').trim().toLowerCase();
 
