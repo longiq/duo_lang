@@ -44,7 +44,7 @@
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="targetText0" class="text-content placeholder"></p>
+      <p id="targetText0" class="text-content placeholder" aria-live="polite" aria-atomic="true"></p>
     </section>
 
     <section class="card" id="targetCard1">
@@ -54,20 +54,22 @@
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z"/></svg>
         </button>
       </div>
-      <p id="targetText1" class="text-content placeholder"></p>
+      <p id="targetText1" class="text-content placeholder" aria-live="polite" aria-atomic="true"></p>
     </section>
 
-    <p id="errorMsg" class="error-msg" hidden></p>
+    <p id="errorMsg" class="error-msg" role="alert" hidden></p>
   </main>
 
   <!-- Fixed to the bottom so the mic sits under the thumb rather than at the
        top of a page that scrolls. -->
   <div class="mic-bar">
     <div class="mic-bar-inner">
-      <p id="micStatus" class="mic-status">Bấm micro và nói tiếng Việt</p>
+      <p id="micStatus" class="mic-status" role="status">Bấm micro và nói tiếng Việt</p>
       <div class="mic-row">
-        <span class="mic-slot"></span>
-        <button id="micBtn" class="mic-btn" aria-label="Bấm để nói">
+        <span class="mic-slot">
+          <button type="button" id="historyBtn" class="history-btn">Lịch sử</button>
+        </span>
+        <button id="micBtn" class="mic-btn" aria-label="Bấm để nói" aria-pressed="false">
           <svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor">
             <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
             <path d="M19 11a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.94V22h2v-2.06A9 9 0 0 0 21 11h-2z"/>
@@ -77,6 +79,23 @@
           <button type="button" id="retranslateBtn" class="retranslate-btn" disabled>Dịch lại</button>
         </span>
       </div>
+    </div>
+  </div>
+
+  <!-- Fixed overlay acting as its own backdrop; the sliding card inside is the
+       actual dialog. Kept in this file rather than a separate one so sw.js's
+       STATIC_ASSETS list needs no change. -->
+  <div id="historySheet" class="history-sheet" hidden>
+    <div class="history-panel" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+      <div class="history-header">
+        <h2 id="historyTitle">Lịch sử</h2>
+        <div class="history-header-actions">
+          <button type="button" id="historyClearBtn" class="history-clear-btn">Xoá hết</button>
+          <button type="button" id="historyCloseBtn" class="history-close-btn" aria-label="Đóng lịch sử">✕</button>
+        </div>
+      </div>
+      <ul id="historyList" class="history-list"></ul>
+      <p id="historyEmpty" class="history-empty" hidden>Chưa có câu nào.</p>
     </div>
   </div>
 

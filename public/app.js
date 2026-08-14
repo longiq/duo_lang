@@ -24,6 +24,17 @@ const LANGS = {
 // Fixed order so the two target panes never swap position unexpectedly.
 const LANG_ORDER = ['vi', 'en', 'ja'];
 const SOURCE_STORAGE_KEY = 'duolang.sourceLang';
+const HISTORY_STORAGE_KEY = 'duolang.history';
+// About a day of use and roughly 10KB of JSON. Capped by entry count rather
+// than measured size: localStorage.setItem is synchronous and runs right on
+// the hot path after a translation lands, so there's no room for anything
+// heavier than a length check there.
+const HISTORY_MAX = 50;
+// flash-lite answers in about a second (see server/index.js's model comment);
+// 12s is 12x headroom before giving up rather than leaving "Đang dịch..." on
+// screen for as long as the page stays open.
+const TRANSLATE_TIMEOUT_MS = 12000;
+const TTS_TIMEOUT_MS = 15000;
 
 const micBtn = document.getElementById('micBtn');
 const micStatus = document.getElementById('micStatus');
@@ -32,6 +43,12 @@ const langSwitch = document.getElementById('langSwitch');
 const sourceInput = document.getElementById('sourceText');
 const retranslateBtn = document.getElementById('retranslateBtn');
 const errorMsg = document.getElementById('errorMsg');
+const historyBtn = document.getElementById('historyBtn');
+const historySheet = document.getElementById('historySheet');
+const historyList = document.getElementById('historyList');
+const historyEmpty = document.getElementById('historyEmpty');
+const historyClearBtn = document.getElementById('historyClearBtn');
+const historyCloseBtn = document.getElementById('historyCloseBtn');
 const targetPanes = [0, 1].map((i) => ({
   label: document.getElementById(`targetLabel${i}`),
   text: document.getElementById(`targetText${i}`),
@@ -75,7 +92,13 @@ function clearTranslations() {
   translations = {};
   lastTranslatedText = '';
   targetPanes.forEach((pane) => {
+    // Silence the live region for the placeholder write: aria-live is meant
+    // to announce a translation landing, and this runs on every mic tap and
+    // every language switch -- without turning it off first, a screen reader
+    // would read the placeholder text out loud each time too.
+    pane.text.setAttribute('aria-live', 'off');
     setText(pane.text, LANGS[pane.lang].targetPlaceholder, true);
+    pane.text.setAttribute('aria-live', 'polite');
     pane.speak.disabled = true;
   });
 }
@@ -97,8 +120,12 @@ function applySourceLang(lang, { keepText = false } = {}) {
     pane.lang = targetLangs[i];
     pane.label.textContent = LANGS[pane.lang].label;
     pane.speak.setAttribute('aria-label', `Nghe ${LANGS[pane.lang].label}`);
+    // Without this a screen reader reads every language in whatever voice its
+    // own UI is set to -- Japanese narrated in an English voice, for example.
+    pane.text.lang = LANGS[pane.lang].bcp47;
   });
 
+  sourceInput.lang = LANGS[lang].bcp47;
   sourceInput.placeholder = LANGS[lang].sourcePlaceholder;
   subtitle.textContent = `Nói ${LANGS[lang].label.replace(/^\S+\s/, '')} → dịch cùng lúc sang 2 ngôn ngữ còn lại`;
   micStatus.textContent = idlePrompt();
@@ -125,6 +152,28 @@ function showTranslations(result) {
   });
 }
 
+// Nothing in the browser times a fetch out on its own: a Gemini call that
+// never answers would otherwise leave "Đang dịch..." on screen for as long as
+// the page stays open. AbortController rather than AbortSignal.timeout, which
+// iOS only gained in 16.
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// A fetch rejection's message is the browser's own, in English ("Failed to
+// fetch", "The user aborted a request") -- it has no business reaching a
+// screen that's otherwise entirely Vietnamese. Nothing the network layer says
+// is ever shown directly; only these mapped messages are.
+function networkMessage(err) {
+  if (err && err.name === 'AbortError') return 'Mạng chậm quá, thử lại nhé.';
+  // onLine is only trustworthy in the false direction: true does not mean
+  // there is actually a working connection, just that the OS thinks so.
+  if (navigator.onLine === false) return 'Đang ngoại tuyến, cần mạng để dịch.';
+  return 'Không kết nối được máy chủ, thử lại nhé.';
+}
+
 async function translate(text) {
   clearError();
 
@@ -145,14 +194,20 @@ async function translate(text) {
 
   micStatus.textContent = 'Đang dịch...';
   try {
-    const res = await fetch('/api/translate', {
+    const res = await fetchWithTimeout('/api/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, source: sourceLang, targets: targetLangs }),
-    });
-    const data = await res.json();
+    }, TRANSLATE_TIMEOUT_MS);
+    // A response that isn't JSON at all (nginx's own error page, a captive
+    // portal) would otherwise throw a SyntaxError with an English message
+    // straight past the catch below's network-specific handling.
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(data.error || 'Lỗi dịch thuật.');
+      // The server's error strings are already Vietnamese (server/index.js) --
+      // shown as-is, unlike the network failures caught below.
+      showError(data.error || 'Lỗi dịch thuật.');
+      return;
     }
 
     const result = data.translations || data;
@@ -161,14 +216,143 @@ async function translate(text) {
     });
     showTranslations(result);
     lastTranslatedText = text;
-    micStatus.textContent = idlePrompt();
+    addHistoryEntry(text, sourceLang, result);
   } catch (err) {
-    showError(err.message || 'Không thể dịch câu này.');
-    micStatus.textContent = idlePrompt();
+    // Only reached for an actual network/timeout failure -- a non-2xx
+    // response took the branch above instead of throwing.
+    showError(networkMessage(err));
   } finally {
+    micStatus.textContent = idlePrompt();
     refreshRetranslateState();
   }
 }
+
+// --- history -----------------------------------------------------------
+// A convenience, not a record: localStorage can be evicted under storage
+// pressure (iOS standalone PWAs especially), and it's also writable by any
+// script that has ever run on this origin, so loaded entries are treated as
+// untrusted -- validated on read, and only ever written to the DOM via
+// textContent, never innerHTML.
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((e) => e && typeof e.text === 'string' && LANGS[e.source] && e.tr && typeof e.tr === 'object');
+  } catch (err) {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try { localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(list)); } catch (err) { /* private mode, or evicted */ }
+}
+
+// Called only from the fetch-success path in translate(), never for a
+// client-cache hit -- otherwise every repeat of an already-spoken sentence
+// would re-save it too, which the dedupe below would just discard anyway,
+// for no benefit.
+function addHistoryEntry(text, source, tr) {
+  const list = loadHistory();
+  const newest = list[0];
+  // Retranslating or re-speaking the same sentence must not add a second row.
+  if (newest && newest.source === source && newest.text === text) return;
+  list.unshift({ at: Date.now(), source, text, tr });
+  saveHistory(list.slice(0, HISTORY_MAX));
+}
+
+function formatHistoryMeta(entry) {
+  const time = new Date(entry.at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+  return `${LANGS[entry.source].label} · ${time}`;
+}
+
+// Rendered only when the sheet opens, not on every save -- keeps the
+// post-translation path free of DOM work.
+function renderHistoryList() {
+  const list = loadHistory();
+  historyList.textContent = '';
+  historyEmpty.hidden = list.length > 0;
+
+  list.forEach((entry) => {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'history-row';
+
+    const main = document.createElement('div');
+    main.className = 'history-row-source';
+    main.textContent = entry.text;
+
+    const meta = document.createElement('div');
+    meta.className = 'history-row-meta';
+    meta.textContent = formatHistoryMeta(entry);
+
+    btn.appendChild(main);
+    btn.appendChild(meta);
+    btn.addEventListener('click', () => restoreHistoryEntry(entry));
+    li.appendChild(btn);
+    historyList.appendChild(li);
+  });
+}
+
+// Restores a past sentence and its translations with zero network calls: the
+// translations are already known, so this just repaints the same state
+// translate() would have arrived at.
+function restoreHistoryEntry(entry) {
+  if (entry.source !== sourceLang) {
+    applySourceLang(entry.source); // repoints the panes, clears, sets sourceInput.value = ''
+  }
+  sourceInput.value = entry.text;
+  autoGrow();
+  targetLangs.forEach((lang) => {
+    if (entry.tr[lang]) translationCache.set(`${entry.source}|${lang}|${entry.text}`, entry.tr[lang]);
+  });
+  showTranslations(entry.tr);
+  lastTranslatedText = entry.text;
+  refreshRetranslateState();
+  clearError();
+  closeHistorySheet();
+}
+
+function openHistorySheet() {
+  renderHistoryList();
+  historySheet.hidden = false;
+  // So the Android back gesture closes the sheet instead of exiting the PWA --
+  // without this, a bottom sheet with no history entry of its own is the
+  // single most common way that gesture surprises a user.
+  history.pushState({ sheet: 'history' }, '');
+}
+
+// viaPopState distinguishes "the browser already popped our pushed state"
+// (the user pressed back) from every other close path, which still needs to
+// pop it themselves via history.back() -- calling that unconditionally would
+// double-pop and take the user back past wherever they were before opening
+// the sheet at all.
+function closeHistorySheet({ viaPopState = false } = {}) {
+  if (historySheet.hidden) return;
+  historySheet.hidden = true;
+  if (!viaPopState) history.back();
+}
+
+historyBtn.addEventListener('click', openHistorySheet);
+historyCloseBtn.addEventListener('click', () => closeHistorySheet());
+historyClearBtn.addEventListener('click', () => {
+  saveHistory([]);
+  renderHistoryList();
+});
+// Only the backdrop itself, not a click that bubbled up from the panel or a
+// row inside it.
+historySheet.addEventListener('click', (event) => {
+  if (event.target === historySheet) closeHistorySheet();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !historySheet.hidden) closeHistorySheet();
+});
+window.addEventListener('popstate', () => {
+  if (!historySheet.hidden) closeHistorySheet({ viaPopState: true });
+});
 
 langSwitch.addEventListener('click', (event) => {
   const btn = event.target.closest('.lang-btn');
@@ -260,7 +444,26 @@ function speakWithDeviceVoice(text, bcp47) {
 
 let audioCtx = null;
 let currentSource = null;
+// Decoded AudioBuffers, not strings: a 5s 24kHz mono clip is Float32 PCM at
+// roughly 480KB, so an unbounded cache here (unlike translationCache above,
+// which is harmless strings) could hold tens of MB of heap in a mobile PWA
+// after a long session or a lot of history replays. Capped the same way the
+// server caches are, LRU by most-recently-played.
 const audioCache = new Map();
+const AUDIO_CACHE_MAX = 20;
+
+function audioCacheGet(key) {
+  if (!audioCache.has(key)) return null;
+  const value = audioCache.get(key);
+  audioCache.delete(key);
+  audioCache.set(key, value); // reinsert to mark it recent
+  return value;
+}
+
+function audioCacheSet(key, value) {
+  audioCache.set(key, value);
+  while (audioCache.size > AUDIO_CACHE_MAX) audioCache.delete(audioCache.keys().next().value);
+}
 
 // Must be called synchronously from the click handler: iOS only allows a
 // context to start or resume inside a user gesture.
@@ -334,14 +537,14 @@ function playBuffer(ctx, buffer) {
 
 async function speakViaServer(ctx, text, lang) {
   const key = `${lang}|${text}`;
-  let buffer = audioCache.get(key);
+  let buffer = audioCacheGet(key);
 
   if (!buffer) {
-    const res = await fetch('/api/tts', {
+    const res = await fetchWithTimeout('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, lang }),
-    });
+    }, TTS_TIMEOUT_MS);
     if (!res.ok) {
       const err = new Error('speech request failed');
       // Distinguish the budget cap so the user is told why it sounds different.
@@ -352,7 +555,7 @@ async function speakViaServer(ctx, text, lang) {
       throw err;
     }
     buffer = await decodeAudio(ctx, await res.arrayBuffer());
-    audioCache.set(key, buffer);
+    audioCacheSet(key, buffer);
   }
 
   playBuffer(ctx, buffer);
@@ -408,6 +611,7 @@ if (!SpeechRecognitionImpl) {
     translationStarted = false;
     sessionFailed = false;
     micBtn.classList.add('recording');
+    micBtn.setAttribute('aria-pressed', 'true');
     micStatus.textContent = 'Đang nghe...';
     clearError();
   });
@@ -415,6 +619,7 @@ if (!SpeechRecognitionImpl) {
   recognition.addEventListener('end', () => {
     isRecording = false;
     micBtn.classList.remove('recording');
+    micBtn.setAttribute('aria-pressed', 'false');
     if (!translationStarted && lastTranscript) {
       translationStarted = true;
       translate(lastTranscript);
@@ -427,6 +632,7 @@ if (!SpeechRecognitionImpl) {
     isRecording = false;
     sessionFailed = true;
     micBtn.classList.remove('recording');
+    micBtn.setAttribute('aria-pressed', 'false');
     if (event.error === 'no-speech') {
       micStatus.textContent = 'Không nghe thấy gì, thử lại nhé.';
     } else if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {

@@ -112,6 +112,29 @@ sudo systemctl restart duolang
 
 `.env` và `node_modules` nằm trong `.gitignore` nên `reset --hard` không xoá chúng. Hoặc chỉ cần chạy lại `bootstrap.sh` — nó làm đúng các bước trên.
 
+## Nếu bị lạm dụng
+
+App không có đăng nhập, chỉ có rate limit theo IP (server/index.js) và trần dịch/ngày
+(`TRANSLATE_DAILY_MAX`, mặc định 400). Rate limit theo IP không chặn được abuser
+dùng nhiều IP; nếu điều đó thực sự xảy ra:
+
+1. **Hạ `TRANSLATE_DAILY_MAX`** trong `.env` rồi `sudo systemctl restart duolang` —
+   chặn cứng, hiệu lực ngay, nhưng chặn luôn cả người dùng thật khi hết trần.
+2. **Chặn IP ở tầng nginx**, sửa trực tiếp `/etc/nginx/sites-available/duolang`
+   trên máy chủ (không phải file `deploy/nginx.conf` trong repo — certbot đã sửa
+   file trên máy nên `deploy/nginx.conf` không còn khớp, và bootstrap.sh không
+   ghi đè file đã tồn tại):
+   ```nginx
+   location / {
+       deny 1.2.3.4;
+       # ... proxy_pass như cũ
+   }
+   ```
+   rồi `sudo nginx -t && sudo systemctl reload nginx`.
+
+Chưa cắm mã truy cập (access code) vì chưa cần — `isPrivileged()` trong
+`server/index.js` là chỗ nối sẵn nếu sau này cần bật.
+
 ## Máy đang chạy
 
 | Máy | IP | Domain | Trạng thái |

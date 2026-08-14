@@ -92,13 +92,20 @@ Nếu muốn chặn cứng bằng cách tự tắt billing thì cần Budget →
 
 ## 6. Đổi giọng nếu muốn
 
-Mặc định dùng WaveNet (1 triệu ký tự/tháng miễn phí):
+Giọng của từng tier khai báo trong `TIER_VOICES` (`server/index.js`), không phải qua biến môi trường —
+tự sửa file nếu muốn đổi tên giọng:
 
-```bash
-CLOUD_VOICE_VI=vi-VN-Wavenet-A
-CLOUD_VOICE_EN=en-US-Wavenet-F
-CLOUD_VOICE_JA=ja-JP-Wavenet-B
+```js
+const TIER_VOICES = {
+  'Chirp3-HD': { vi: 'vi-VN-Chirp3-HD-Achernar', en: 'en-US-Chirp3-HD-Achernar', ja: 'ja-JP-Chirp3-HD-Achernar' },
+  Neural2: { vi: 'vi-VN-Neural2-A', en: 'en-US-Neural2-F', ja: 'ja-JP-Neural2-B' },
+  Wavenet: { vi: 'vi-VN-Wavenet-A', en: 'en-US-Wavenet-F', ja: 'ja-JP-Wavenet-B' },
+  Standard: { vi: 'vi-VN-Standard-A', en: 'en-US-Standard-C', ja: 'ja-JP-Standard-A' },
+};
 ```
+
+Muốn đổi thứ tự thử hoặc bỏ bớt tier thì sửa `TTS_TIER_ORDER` trong `.env`
+(mục 4 ở trên), ví dụ chỉ dùng Wavenet và Standard: `TTS_TIER_ORDER=Wavenet,Standard`.
 
 Xem danh sách giọng có sẵn cho một ngôn ngữ:
 

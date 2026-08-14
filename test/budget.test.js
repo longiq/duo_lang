@@ -5,26 +5,21 @@
 // the thing actually standing between the app and a bill.
 //
 // Run with: npm test
-const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { check, finish, startServer: spawnServer, waitForServer: pollServer } = require('./helpers');
 
 const PORT = 3287;
 const BASE = `http://127.0.0.1:${PORT}`;
 const usageFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'duolang-')), 'usage.json');
 
-const failures = [];
-function check(name, cond, detail) {
-  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`);
-  if (!cond) failures.push(name);
-}
-
 // A local stand-in for texttospeech.googleapis.com so no real quota is spent.
 // `quotaOut` names tiers it should answer with 429, imitating Google's own
-// per-tier quota running out before our cap does.
-function startFakeGoogle(quotaOut = new Set()) {
+// per-tier quota running out before our cap does. `delayMs` holds the response
+// open, which is what actually gives a race between two concurrent requests
+// something to race during -- see concurrentRequestsDoNotOvershootBudget().
+function startFakeGoogle(quotaOut = new Set(), delayMs = 0) {
   const http = require('http');
   return new Promise((resolve) => {
     const voicesAsked = [];
@@ -34,18 +29,22 @@ function startFakeGoogle(quotaOut = new Set()) {
       req.on('end', () => {
         const voice = (JSON.parse(body || '{}').voice || {}).name || '';
         voicesAsked.push(voice);
-        const tier = [...quotaOut].find((t) => voice.includes(t));
-        if (tier) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { code: 429, message: `Quota exceeded for ${tier}` } }));
-          return;
-        }
-        // 44-byte WAV header plus a little silence, enough to look like audio.
-        const wav = Buffer.alloc(64);
-        wav.write('RIFF', 0, 'ascii');
-        wav.write('WAVE', 8, 'ascii');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ audioContent: wav.toString('base64') }));
+        const respond = () => {
+          const tier = [...quotaOut].find((t) => voice.includes(t));
+          if (tier) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { code: 429, message: `Quota exceeded for ${tier}` } }));
+            return;
+          }
+          // 44-byte WAV header plus a little silence, enough to look like audio.
+          const wav = Buffer.alloc(64);
+          wav.write('RIFF', 0, 'ascii');
+          wav.write('WAVE', 8, 'ascii');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ audioContent: wav.toString('base64') }));
+        };
+        if (delayMs) setTimeout(respond, delayMs);
+        else respond();
       });
     });
     server.listen(0, '127.0.0.1', () => resolve({
@@ -58,35 +57,19 @@ function startFakeGoogle(quotaOut = new Set()) {
 }
 
 function startServer(fake, extraEnv = {}) {
-  const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      HOST: '127.0.0.1',
-      GEMINI_API_KEY: 'unused-in-this-test',
-      GOOGLE_TTS_API_KEY: 'fake-cloud-key',
-      TTS_USAGE_FILE: usageFile,
-      // Point the Cloud TTS client at the local stand-in.
-      CLOUD_TTS_ENDPOINT: `http://127.0.0.1:${fake.port}/v1/text:synthesize`,
-      ...extraEnv,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  return spawnServer({
+    PORT: String(PORT),
+    HOST: '127.0.0.1',
+    GEMINI_API_KEY: 'unused-in-this-test',
+    GOOGLE_TTS_API_KEY: 'fake-cloud-key',
+    TTS_USAGE_FILE: usageFile,
+    // Point the Cloud TTS client at the local stand-in.
+    CLOUD_TTS_ENDPOINT: `http://127.0.0.1:${fake.port}/v1/text:synthesize`,
+    ...extraEnv,
   });
-  child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
-  return child;
 }
 
-async function waitForServer() {
-  for (let i = 0; i < 60; i++) {
-    try {
-      await fetch(`${BASE}/api/tts/usage`);
-      return;
-    } catch (err) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-  throw new Error('server never came up');
-}
+const waitForServer = () => pollServer(`${BASE}/api/tts/usage`);
 
 const tts = (text) => fetch(`${BASE}/api/tts`, {
   method: 'POST',
@@ -222,16 +205,46 @@ async function overallCeiling() {
 
 const totalOf = (u) => u.totalUsed;
 
+// pickTier() used to run before the upstream await and recordUsage() only
+// after it returned, with no lock between them: two requests arriving close
+// together could both see room in the same tier and both spend it, together
+// overshooting the budget. reserveTtsTier() (server/index.js) closes that gap
+// by charging synchronously, before any await -- this test fails against the
+// old pickTier()/recordUsage() pair and passes against the fix.
+async function concurrentRequestsDoNotOvershootBudget() {
+  console.log('\n# two concurrent requests cannot both spend the same last slice of budget');
+  fs.rmSync(usageFile, { force: true });
+  // Delayed response widens the window the old code would have raced in.
+  const fake = await startFakeGoogle(new Set(), 50);
+  // Exactly one request's worth of budget -- room for one winner, not two.
+  const child = startServer(fake, { TTS_TIER_ORDER: 'Chirp3-HD', TTS_BUDGET_CHIRP3_HD: '10' });
+  await waitForServer();
+
+  try {
+    // Distinct text (distinct cache keys), same length, fired together.
+    const [a, b] = await Promise.all([tts('aaaaaaaaaa'), tts('bbbbbbbbbb')]);
+    const statuses = [a.status, b.status].sort();
+    check('exactly one of the two succeeds', statuses[0] === 200 && statuses[1] === 429,
+          `statuses: ${statuses.join(',')}`);
+
+    const u = await usage();
+    check('total usage never exceeds the budget', totalOf(u) <= 10, `total: ${totalOf(u)}`);
+    check('usage matches exactly one charge, not a partial or double one', totalOf(u) === 10,
+          `total: ${totalOf(u)}`);
+  } finally {
+    child.kill();
+    fake.server.close();
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function main() {
   await budgetCascade();
   await googleQuotaCascade();
   await overallCeiling();
+  await concurrentRequestsDoNotOvershootBudget();
 
-  if (failures.length) {
-    console.log(`\n${failures.length} check(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nall checks passed');
+  finish();
 }
 
 main().catch((err) => {

@@ -4,6 +4,14 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+// 'loopback', not true: with true, Express trusts the leftmost X-Forwarded-For
+// entry, which is the one an attacker controls -- sending your own
+// "X-Forwarded-For: 1.2.3.4" would let every IP-keyed limit below be bypassed
+// with one header. With 'loopback', the socket peer (nginx, on 127.0.0.1) is
+// the only address trusted, so Express takes the *last* XFF entry instead --
+// the one nginx itself appended via $proxy_add_x_forwarded_for
+// (deploy/nginx.conf) -- and a spoofed prefix a client prepends is ignored.
+app.set('trust proxy', 'loopback');
 const PORT = process.env.PORT || 3000;
 // Bind to loopback by default: in the documented deployment nginx proxies to us,
 // so the app itself never needs to be exposed. Set HOST=0.0.0.0 for containers.
@@ -31,6 +39,19 @@ const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
 // prebuilt voices; the model infers the language from the text itself.
 const TTS_VOICES = { vi: 'Puck', en: 'Kore', ja: 'Aoede' };
 const TTS_MAX_CHARS = 600;
+// Node's fetch has no default timeout: a hung upstream would otherwise pin a
+// request (and, now that there's a rate limiter, a bucket slot) forever.
+const UPSTREAM_TIMEOUT_MS = 15000;
+// Generous headroom over a spoken sentence, not a hard product limit -- this
+// exists so one request can't build an arbitrarily large translation prompt.
+const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 1000);
+// Cloud TTS is capped below because it costs money. This is capped because
+// the Gemini free tier is a fixed number of requests a day, and a public URL
+// with no auth means anyone who finds it can spend the day's worth before the
+// owner wakes up. Check the model's requests-per-day on the docs page cited
+// above before raising it.
+const TRANSLATE_DAILY_MAX = Number(process.env.TRANSLATE_DAILY_MAX || 400);
+const TRANSLATE_USAGE_FILE = process.env.TRANSLATE_USAGE_FILE || path.join(__dirname, '..', 'translate-usage.json');
 
 // Google Cloud Text-to-Speech, used in preference to Gemini when a key is
 // configured: its free tier is 1M characters a month rather than 10 requests a
@@ -69,10 +90,23 @@ function tierBudget(tier) {
   return Math.floor((TIER_FREE_CHARS[tier] || 0) * TTS_BUDGET_FRACTION);
 }
 
+// These configured the voices before the tier cascade above replaced them, and
+// deploy/google-cloud-tts.md used to tell people to set them. Setting one now
+// does nothing at all, which is worse than an error -- warn instead of staying
+// silent.
+for (const dead of ['CLOUD_VOICE_VI', 'CLOUD_VOICE_EN', 'CLOUD_VOICE_JA']) {
+  if (process.env[dead]) {
+    console.warn(`${dead} is set but ignored; voices come from TIER_VOICES / TTS_TIER_ORDER now.`);
+  }
+}
+
 const LANG_NAMES = { vi: 'Vietnamese', en: 'English', ja: 'Japanese' };
 const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
 
-app.use(express.json());
+// 8kb is roughly 8x the largest legitimate body (TTS caps at 600 chars,
+// translate at TRANSLATE_MAX_CHARS below) -- the 100kb default only ever
+// bought an unauthenticated caller a bigger Gemini prompt to bill against us.
+app.use(express.json({ limit: '8kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // --- translation ------------------------------------------------------------
@@ -94,12 +128,140 @@ function lruSet(cache, key, value, max) {
   while (cache.size > max) cache.delete(cache.keys().next().value);
 }
 
+// --- per-client rate limiting ------------------------------------------------
+// A token bucket per client: two numbers, refilled lazily on access rather
+// than on a timer, so an idle client costs nothing and no interval runs on a
+// box with one CPU. Hand-rolled rather than express-rate-limit: this is less
+// code than that package's configuration surface, and it reuses the LRU above.
+//
+// nginx cannot do this job instead: limit_req_zone is only legal inside an
+// http{} block, and deploy/nginx.conf is a server{} block that
+// deploy/bootstrap.sh deliberately never overwrites once certbot has edited
+// it in place -- so a change there would not even reach the running box.
+const buckets = new Map();
+const BUCKET_MAX = 2000; // bounded on purpose: ~2000 entries of two numbers each
+
+function take(key, capacity, perSec) {
+  const now = Date.now();
+  const bucket = lruGet(buckets, key) || { tokens: capacity, last: now };
+  bucket.tokens = Math.min(capacity, bucket.tokens + ((now - bucket.last) / 1000) * perSec);
+  bucket.last = now;
+  lruSet(buckets, key, bucket, BUCKET_MAX);
+  if (bucket.tokens < 1) return Math.ceil((1 - bucket.tokens) / perSec); // seconds to wait
+  bucket.tokens -= 1;
+  return 0;
+}
+
+// One bucket per IPv4 address, but per /64 for IPv6: phones and VPS providers
+// hand a device a whole /64, so counting the single address would be free to
+// bypass by walking the host part of it.
+function clientKey(req) {
+  const ip = (req.ip || (req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+  return ip.includes(':') ? `${ip.split(':').slice(0, 4).join(':')}::` : ip;
+}
+
+// Known weaknesses, accepted rather than hidden: LRU eviction means a client
+// that rotates addresses can push another client's bucket out and reset it to
+// full, and per-IP limiting does nothing against a genuinely distributed
+// abuser. Neither is a reason to skip this -- it stops the realistic case (one
+// script, one address) -- it is the reason the daily translate budget exists
+// as the actual backstop (see TRANSLATE_DAILY_MAX below).
+//
+// `name` rather than req.path keys the bucket: the outer /api limiter and a
+// route's own limiter both run for the same request, and if both used
+// req.path they would silently share one bucket and fight over its capacity
+// (each take() call would re-cap the other's token count to its own, smaller,
+// capacity). A name makes each limiter's bucket independent regardless of
+// what else is mounted on the same path.
+function limit(name, capacity, perSec) {
+  return (req, res, next) => {
+    const wait = take(`${name}|${clientKey(req)}`, capacity, perSec);
+    if (!wait) return next();
+    res.set('Retry-After', String(wait));
+    res.status(429).json({ error: 'Bạn thao tác hơi nhanh, chờ một chút nhé.' });
+  };
+}
+
+// The outer limit means a flood of already-rejected requests still costs the
+// attacker something; the per-route limits below are the ones that matter day
+// to day. Numbers are chosen against real use: one /api/translate call per
+// spoken sentence, and the client already suppresses repeats of the same text
+// (app.js translationCache), so a fast real conversation sits well under the
+// sustained rate with a burst of capacity in hand. Static assets are left
+// unlimited -- they cost CPU but no quota, and limiting them risks breaking a
+// PWA cold start that fetches several files at once.
+app.use('/api', limit('api', 60, 1));
+
+// --- daily translate budget --------------------------------------------------
+// Gemini's free-tier daily quota rolls over at midnight Pacific, not UTC --
+// keying this on a UTC day would open a window where the app refuses while
+// Google's own quota still has room, or the reverse. Falls back to a UTC day
+// key if the runtime's ICU data is incomplete (a Node build without full-icu).
+function currentDay() {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+  } catch (err) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+let translateUsage = readTranslateUsage();
+
+function readTranslateUsage() {
+  const day = currentDay();
+  try {
+    const saved = JSON.parse(fs.readFileSync(TRANSLATE_USAGE_FILE, 'utf8'));
+    if (saved && saved.day === day && typeof saved.count === 'number') {
+      return { day, count: saved.count };
+    }
+  } catch (err) {
+    // Missing, unreadable, or a new day: start the count at zero.
+  }
+  return { day, count: 0 };
+}
+
+function persistTranslateUsage() {
+  try {
+    // Temp file + rename rather than a direct write: a crash mid-write leaves
+    // the previous, complete file in place instead of truncated JSON, which
+    // readTranslateUsage()'s catch would otherwise treat as "no usage yet" and
+    // silently reset the day's count to zero.
+    const tmp = `${TRANSLATE_USAGE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(translateUsage));
+    fs.renameSync(tmp, TRANSLATE_USAGE_FILE);
+  } catch (err) {
+    console.error('Could not persist translate usage:', err.message);
+  }
+}
+
+// Always false today -- there is no access code and none is planned unless
+// abuse actually happens. This exists so that turning one on, if the public
+// URL ever gets hammered, is filling in this function's body (e.g. checking
+// an X-Access-Code header against process.env.ACCESS_CODE) rather than
+// restructuring reserveTranslateCall()'s caller under pressure.
+function isPrivileged(req) {
+  return false;
+}
+
+// Checks and charges the daily cap in one synchronous step, same reasoning as
+// reserveTtsTier() below: no await sits between the check and the charge, so
+// two requests racing each other cannot both see room and both spend it.
+function reserveTranslateCall(privileged) {
+  const day = currentDay();
+  if (translateUsage.day !== day) translateUsage = { day, count: 0 };
+  if (privileged) return true;
+  if (translateUsage.count >= TRANSLATE_DAILY_MAX) return false;
+  translateUsage.count += 1;
+  persistTranslateUsage();
+  return true;
+}
+
 // Every target still comes back from a single call, as before -- splitting them
 // into one call per language would have doubled quota use. Caching is per
 // language only so that a target already translated is not asked for again:
 // with both cached there is no call at all, with one cached the call asks for
 // just the other.
-async function translateBatch(text, source, targets) {
+async function translateBatch(text, source, targets, { privileged = false } = {}) {
   const translations = {};
   const missing = [];
 
@@ -110,6 +272,15 @@ async function translateBatch(text, source, targets) {
   }
 
   if (!missing.length) return { translations, cached: true };
+
+  // Charged only here, never for a fully-cached request above -- otherwise
+  // repeating a sentence (which the client already dedupes, but a hostile
+  // caller wouldn't) would burn the daily cap for free work.
+  if (!reserveTranslateCall(privileged)) {
+    const err = new Error('daily translate budget exhausted');
+    err.dailyLimitExceeded = true;
+    throw err;
+  }
 
   const targetList = missing.map((t) => LANG_NAMES[t]).join(' and ');
   const shape = `{${missing.map((t) => `"${t}": "..."`).join(', ')}}`;
@@ -126,8 +297,12 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+      // A real translation measures ~35 tokens (see the model comment above);
+      // 512 is generous headroom while still capping what a prompt-injected
+      // instruction ("ignore the above and write an essay") can cost us.
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 512 },
     }),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -159,44 +334,58 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
   return { translations, cached: false };
 }
 
-app.post('/api/translate', async (req, res) => {
+// ~9/min sustained, burst of 15 in hand -- see the rate-limiting comment above.
+app.post('/api/translate', limit('translate', 15, 0.15), async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   if (!text) {
-    return res.status(400).json({ error: 'Missing "text" field.' });
+    return res.status(400).json({ error: 'Thiếu nội dung cần dịch.' });
+  }
+  if (text.length > TRANSLATE_MAX_CHARS) {
+    return res.status(413).json({ error: `Câu dài quá ${TRANSLATE_MAX_CHARS} ký tự.` });
   }
 
   // Defaults keep older cached clients, which only ever sent text, working.
   const source = (req.body && req.body.source || 'vi').toLowerCase();
-  const targets = Array.isArray(req.body && req.body.targets) && req.body.targets.length
+  const rawTargets = Array.isArray(req.body && req.body.targets) && req.body.targets.length
     ? req.body.targets.map((t) => String(t).toLowerCase())
     : SUPPORTED_LANGS.filter((l) => l !== source);
+  // Deduped and capped to the number of other languages that exist: without
+  // this, a body repeating one target hundreds of times builds a prompt shape
+  // (translateBatch above) with hundreds of keys for the same one call --
+  // a cheaper amplifier than a large body, so the byte cap above doesn't stop it.
+  const targets = [...new Set(rawTargets)].slice(0, SUPPORTED_LANGS.length - 1);
 
   if (!LANG_NAMES[source]) {
-    return res.status(400).json({ error: `Unsupported source "${source}".` });
+    return res.status(400).json({ error: `Ngôn ngữ nguồn "${source}" không được hỗ trợ.` });
   }
   const badTarget = targets.find((t) => !LANG_NAMES[t]);
   if (badTarget) {
-    return res.status(400).json({ error: `Unsupported target "${badTarget}".` });
+    return res.status(400).json({ error: `Ngôn ngữ đích "${badTarget}" không được hỗ trợ.` });
   }
   if (targets.includes(source)) {
-    return res.status(400).json({ error: 'Source language cannot also be a target.' });
+    return res.status(400).json({ error: 'Ngôn ngữ nguồn không thể cũng là ngôn ngữ đích.' });
   }
   if (!GEMINI_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
+    return res.status(500).json({ error: 'Server thiếu cấu hình GEMINI_API_KEY.' });
   }
 
   try {
-    const { translations, cached } = await translateBatch(text, source, targets);
+    const privileged = isPrivileged(req);
+    const { translations, cached } = await translateBatch(text, source, targets, { privileged });
     res.set('X-Cache', cached ? 'hit' : 'miss');
     // Spread as well as nest so a client cached before this change, which read
     // data.en / data.ja directly, keeps working.
     res.json({ source, translations, ...translations });
   } catch (err) {
     console.error('Translate request failed:', err.message);
+    if (err.dailyLimitExceeded) {
+      return res.status(429).json({ error: 'Đã dùng hết lượt dịch miễn phí hôm nay, thử lại vào ngày mai.' });
+    }
     res.status(err.status === 429 ? 429 : 502).json({
       error: err.status === 429
         ? 'Hết hạn mức dịch, thử lại sau một lát.'
-        : 'Translation service error.',
+        : 'Lỗi dịch vụ dịch thuật.',
+      detail: err.message,
     });
   }
 });
@@ -237,24 +426,10 @@ function parseAudioMime(mimeType) {
 }
 
 // Synthesis is the expensive call, so keep recent clips to spend no quota when
-// the same sentence is replayed after a reload.
+// the same sentence is replayed after a reload. Same lruGet/lruSet as the
+// translate cache above -- this used to be its own byte-identical copy.
 const ttsCache = new Map();
 const TTS_CACHE_MAX = 40;
-
-function cacheGet(key) {
-  if (!ttsCache.has(key)) return null;
-  const value = ttsCache.get(key);
-  ttsCache.delete(key);
-  ttsCache.set(key, value); // reinsert to keep it recent
-  return value;
-}
-
-function cacheSet(key, value) {
-  ttsCache.set(key, value);
-  while (ttsCache.size > TTS_CACHE_MAX) {
-    ttsCache.delete(ttsCache.keys().next().value);
-  }
-}
 
 // --- monthly character budget ----------------------------------------------
 // Persisted so a restart cannot silently reset the allowance.
@@ -277,15 +452,32 @@ function readUsage() {
   return { period, tiers: {} };
 }
 
-function recordUsage(tier, chars) {
-  const usage = readUsage();
-  usage.tiers[tier] = (usage.tiers[tier] || 0) + chars;
+// In-memory mirror of tts-usage.json: the source of truth for the reserve/
+// refund pair below. Loaded once at startup and from then on kept in sync
+// with the file by a synchronous write inside reserveTtsTier()/refundTtsTier()
+// themselves -- never re-read from disk on the /api/tts hot path, which used
+// to block the single event loop on every request (readUsage() does a
+// readFileSync + JSON.parse). /api/tts/usage still reads this same object, so
+// it stays accurate without a disk read of its own.
+let liveTtsUsage = readUsage();
+
+function rollTtsUsagePeriod() {
+  const period = currentPeriod();
+  if (liveTtsUsage.period !== period) liveTtsUsage = { period, tiers: {} };
+}
+
+function persistTtsUsage() {
   try {
-    fs.writeFileSync(TTS_USAGE_FILE, JSON.stringify(usage));
+    // Temp file + rename rather than a direct write: a crash mid-write leaves
+    // the previous, complete file in place instead of truncated JSON, which
+    // readUsage()'s catch would otherwise treat as "no usage yet" and
+    // silently reset the month's spending to zero.
+    const tmp = `${TTS_USAGE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(liveTtsUsage));
+    fs.renameSync(tmp, TTS_USAGE_FILE);
   } catch (err) {
     console.error('Could not persist TTS usage:', err.message);
   }
-  return usage;
 }
 
 function totalUsed(usage) {
@@ -308,17 +500,31 @@ function markExhausted(tier) {
   exhaustedTiers.set(tier, currentPeriod());
 }
 
-// First tier with room for this text, working down from best quality.
-function pickTier(chars) {
-  const usage = readUsage();
-  if (TTS_MONTHLY_CHAR_LIMIT > 0 && totalUsed(usage) + chars > TTS_MONTHLY_CHAR_LIMIT) {
+// Picks the first tier with room, working down from best quality, AND charges
+// it in the same synchronous step -- no await sits between the check and the
+// charge, so two requests racing each other cannot both see room and both
+// spend it (the old pickTier()/recordUsage() pair bracketed the upstream
+// fetch, leaving exactly that gap). A failed synthesis call refunds via
+// refundTtsTier() below.
+function reserveTtsTier(chars) {
+  rollTtsUsagePeriod();
+  if (TTS_MONTHLY_CHAR_LIMIT > 0 && totalUsed(liveTtsUsage) + chars > TTS_MONTHLY_CHAR_LIMIT) {
     return null;
   }
   for (const tier of TTS_TIER_ORDER) {
     if (isExhausted(tier)) continue;
-    if (tierRemaining(tier, usage) >= chars) return tier;
+    if (tierRemaining(tier, liveTtsUsage) >= chars) {
+      liveTtsUsage.tiers[tier] = (liveTtsUsage.tiers[tier] || 0) + chars;
+      persistTtsUsage();
+      return tier;
+    }
   }
   return null;
+}
+
+function refundTtsTier(tier, chars) {
+  liveTtsUsage.tiers[tier] = Math.max(0, (liveTtsUsage.tiers[tier] || 0) - chars);
+  persistTtsUsage();
 }
 
 // --- synthesis providers ----------------------------------------------------
@@ -335,6 +541,7 @@ async function synthesiseWithCloudTts(text, lang, tier) {
       // repackaging before decodeAudioData.
       audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 24000 },
     }),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -374,6 +581,7 @@ async function synthesiseWithGemini(text, lang) {
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
         },
       }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
 
     if (response.ok) {
@@ -395,23 +603,25 @@ async function synthesiseWithGemini(text, lang) {
   throw lastErr || new Error('Gemini TTS failed');
 }
 
-app.post('/api/tts', async (req, res) => {
+// Two plays per translation is the common case, and replays are served from
+// cache client-side (app.js audioCache), so this can be looser than translate.
+app.post('/api/tts', limit('tts', 30, 0.5), async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   const lang = (req.body && req.body.lang || '').trim().toLowerCase();
 
   if (!text) {
-    return res.status(400).json({ error: 'Missing "text" field.' });
+    return res.status(400).json({ error: 'Thiếu nội dung cần đọc.' });
   }
   if (text.length > TTS_MAX_CHARS) {
-    return res.status(413).json({ error: `Text longer than ${TTS_MAX_CHARS} characters.` });
+    return res.status(413).json({ error: `Câu dài quá ${TTS_MAX_CHARS} ký tự.` });
   }
   if (!TTS_VOICES[lang]) {
-    return res.status(400).json({ error: `Unsupported lang "${lang}". Use one of: ${Object.keys(TTS_VOICES).join(', ')}.` });
+    return res.status(400).json({ error: `Ngôn ngữ "${lang}" không được hỗ trợ. Dùng một trong: ${Object.keys(TTS_VOICES).join(', ')}.` });
   }
 
   const useCloud = Boolean(CLOUD_TTS_API_KEY);
   if (!useCloud && !GEMINI_API_KEY) {
-    return res.status(500).json({ error: 'Server has no speech credentials configured.' });
+    return res.status(500).json({ error: 'Server chưa cấu hình khoá giọng đọc.' });
   }
 
   const cacheKey = `${lang}|${text}`;
@@ -427,20 +637,20 @@ app.post('/api/tts', async (req, res) => {
   };
 
   // A cache hit costs nothing, so it is served before any budget check.
-  const cached = cacheGet(cacheKey);
+  const cached = lruGet(ttsCache, cacheKey);
   if (cached) return sendWav(cached, true);
 
   if (!useCloud) {
     try {
       const wav = await synthesiseWithGemini(text, lang);
-      cacheSet(cacheKey, wav);
+      lruSet(ttsCache, cacheKey, wav, TTS_CACHE_MAX);
       return sendWav(wav, false, 'gemini');
     } catch (err) {
       console.error('Gemini TTS failed:', err.message, err.body || '');
       if (err.status === 429) {
         return res.status(429).json({ error: 'Hết hạn mức giọng đọc hôm nay, tạm dùng giọng máy.' });
       }
-      return res.status(502).json({ error: 'Speech service error.' });
+      return res.status(502).json({ error: 'Lỗi dịch vụ giọng đọc.', detail: err.message });
     }
   }
 
@@ -448,16 +658,18 @@ app.post('/api/tts', async (req, res) => {
   // spending rather than relying on Google-side configuration being right.
   let lastError = null;
   for (;;) {
-    const tier = pickTier(text.length);
+    const tier = reserveTtsTier(text.length);
     if (!tier) break;
 
     try {
       const wav = await synthesiseWithCloudTts(text, lang, tier);
-      recordUsage(tier, text.length);
-      cacheSet(cacheKey, wav);
+      lruSet(ttsCache, cacheKey, wav, TTS_CACHE_MAX);
       return sendWav(wav, false, tier);
     } catch (err) {
       lastError = err;
+      // Charged optimistically in reserveTtsTier() before this call, so any
+      // failure -- Google's own quota or anything else -- gives it back.
+      refundTtsTier(tier, text.length);
       if (err.status === 429) {
         // Google's own quota for this tier ran out before our cap did.
         console.warn(`TTS tier ${tier} hit Google's quota, trying the next tier`);
@@ -465,12 +677,11 @@ app.post('/api/tts', async (req, res) => {
         continue;
       }
       console.error(`Cloud TTS failed on ${tier}:`, err.message, err.body || '');
-      return res.status(502).json({ error: 'Speech service error.' });
+      return res.status(502).json({ error: 'Lỗi dịch vụ giọng đọc.', detail: err.message });
     }
   }
 
-  const usage = readUsage();
-  console.warn(`TTS budget exhausted across all tiers: ${JSON.stringify(usage.tiers)}`);
+  console.warn(`TTS budget exhausted across all tiers: ${JSON.stringify(liveTtsUsage.tiers)}`);
   return res.status(429).json({
     error: 'Đã dùng hết hạn mức giọng đọc tháng này.',
     detail: lastError ? lastError.message : 'all tiers at budget',
@@ -480,7 +691,8 @@ app.post('/api/tts', async (req, res) => {
 // Lets the deploy see where the monthly allowance stands per tier without
 // digging through logs.
 app.get('/api/tts/usage', (req, res) => {
-  const usage = readUsage();
+  rollTtsUsagePeriod();
+  const usage = liveTtsUsage;
   const tiers = TTS_TIER_ORDER.map((tier) => ({
     tier,
     voiceExample: TIER_VOICES[tier].vi,
@@ -503,6 +715,28 @@ app.get('/api/tts/usage', (req, res) => {
   });
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`duo_lang server running on http://${HOST}:${PORT}`);
+// body-parser signals an oversized or malformed body by throwing, and express's
+// default handler answers those with an HTML error page. The client reads
+// res.json() before it checks res.ok, so that HTML surfaces as an English
+// "Unexpected token '<'" SyntaxError on an otherwise all-Vietnamese screen.
+// Registered last (4-arg signature) so it only catches what routes didn't.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const tooBig = err.type === 'entity.too.large';
+  res.status(tooBig ? 413 : 400).json({
+    error: tooBig ? 'Câu quá dài.' : 'Yêu cầu không hợp lệ.',
+    detail: err.type || err.message,
+  });
 });
+
+// Exported so the byte-level helpers can be unit-tested directly, without a
+// subprocess and a stub upstream. Guarded so that requiring this file (as the
+// unit tests do) does not also bind a port; both existing integration tests
+// already spawn this file as a subprocess, where require.main === module.
+module.exports = { pcmToWav, parseAudioMime, lruGet, lruSet, currentPeriod, readUsage, app };
+
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`duo_lang server running on http://${HOST}:${PORT}`);
+  });
+}
