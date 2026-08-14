@@ -24,6 +24,12 @@ const LANGS = {
 // Fixed order so the two target panes never swap position unexpectedly.
 const LANG_ORDER = ['vi', 'en', 'ja'];
 const SOURCE_STORAGE_KEY = 'duolang.sourceLang';
+const HISTORY_STORAGE_KEY = 'duolang.history';
+// About a day of use and roughly 10KB of JSON. Capped by entry count rather
+// than measured size: localStorage.setItem is synchronous and runs right on
+// the hot path after a translation lands, so there's no room for anything
+// heavier than a length check there.
+const HISTORY_MAX = 50;
 // flash-lite answers in about a second (see server/index.js's model comment);
 // 12s is 12x headroom before giving up rather than leaving "Đang dịch..." on
 // screen for as long as the page stays open.
@@ -37,6 +43,12 @@ const langSwitch = document.getElementById('langSwitch');
 const sourceInput = document.getElementById('sourceText');
 const retranslateBtn = document.getElementById('retranslateBtn');
 const errorMsg = document.getElementById('errorMsg');
+const historyBtn = document.getElementById('historyBtn');
+const historySheet = document.getElementById('historySheet');
+const historyList = document.getElementById('historyList');
+const historyEmpty = document.getElementById('historyEmpty');
+const historyClearBtn = document.getElementById('historyClearBtn');
+const historyCloseBtn = document.getElementById('historyCloseBtn');
 const targetPanes = [0, 1].map((i) => ({
   label: document.getElementById(`targetLabel${i}`),
   text: document.getElementById(`targetText${i}`),
@@ -204,6 +216,7 @@ async function translate(text) {
     });
     showTranslations(result);
     lastTranslatedText = text;
+    addHistoryEntry(text, sourceLang, result);
   } catch (err) {
     // Only reached for an actual network/timeout failure -- a non-2xx
     // response took the branch above instead of throwing.
@@ -213,6 +226,133 @@ async function translate(text) {
     refreshRetranslateState();
   }
 }
+
+// --- history -----------------------------------------------------------
+// A convenience, not a record: localStorage can be evicted under storage
+// pressure (iOS standalone PWAs especially), and it's also writable by any
+// script that has ever run on this origin, so loaded entries are treated as
+// untrusted -- validated on read, and only ever written to the DOM via
+// textContent, never innerHTML.
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((e) => e && typeof e.text === 'string' && LANGS[e.source] && e.tr && typeof e.tr === 'object');
+  } catch (err) {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try { localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(list)); } catch (err) { /* private mode, or evicted */ }
+}
+
+// Called only from the fetch-success path in translate(), never for a
+// client-cache hit -- otherwise every repeat of an already-spoken sentence
+// would re-save it too, which the dedupe below would just discard anyway,
+// for no benefit.
+function addHistoryEntry(text, source, tr) {
+  const list = loadHistory();
+  const newest = list[0];
+  // Retranslating or re-speaking the same sentence must not add a second row.
+  if (newest && newest.source === source && newest.text === text) return;
+  list.unshift({ at: Date.now(), source, text, tr });
+  saveHistory(list.slice(0, HISTORY_MAX));
+}
+
+function formatHistoryMeta(entry) {
+  const time = new Date(entry.at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+  return `${LANGS[entry.source].label} · ${time}`;
+}
+
+// Rendered only when the sheet opens, not on every save -- keeps the
+// post-translation path free of DOM work.
+function renderHistoryList() {
+  const list = loadHistory();
+  historyList.textContent = '';
+  historyEmpty.hidden = list.length > 0;
+
+  list.forEach((entry) => {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'history-row';
+
+    const main = document.createElement('div');
+    main.className = 'history-row-source';
+    main.textContent = entry.text;
+
+    const meta = document.createElement('div');
+    meta.className = 'history-row-meta';
+    meta.textContent = formatHistoryMeta(entry);
+
+    btn.appendChild(main);
+    btn.appendChild(meta);
+    btn.addEventListener('click', () => restoreHistoryEntry(entry));
+    li.appendChild(btn);
+    historyList.appendChild(li);
+  });
+}
+
+// Restores a past sentence and its translations with zero network calls: the
+// translations are already known, so this just repaints the same state
+// translate() would have arrived at.
+function restoreHistoryEntry(entry) {
+  if (entry.source !== sourceLang) {
+    applySourceLang(entry.source); // repoints the panes, clears, sets sourceInput.value = ''
+  }
+  sourceInput.value = entry.text;
+  autoGrow();
+  targetLangs.forEach((lang) => {
+    if (entry.tr[lang]) translationCache.set(`${entry.source}|${lang}|${entry.text}`, entry.tr[lang]);
+  });
+  showTranslations(entry.tr);
+  lastTranslatedText = entry.text;
+  refreshRetranslateState();
+  clearError();
+  closeHistorySheet();
+}
+
+function openHistorySheet() {
+  renderHistoryList();
+  historySheet.hidden = false;
+  // So the Android back gesture closes the sheet instead of exiting the PWA --
+  // without this, a bottom sheet with no history entry of its own is the
+  // single most common way that gesture surprises a user.
+  history.pushState({ sheet: 'history' }, '');
+}
+
+// viaPopState distinguishes "the browser already popped our pushed state"
+// (the user pressed back) from every other close path, which still needs to
+// pop it themselves via history.back() -- calling that unconditionally would
+// double-pop and take the user back past wherever they were before opening
+// the sheet at all.
+function closeHistorySheet({ viaPopState = false } = {}) {
+  if (historySheet.hidden) return;
+  historySheet.hidden = true;
+  if (!viaPopState) history.back();
+}
+
+historyBtn.addEventListener('click', openHistorySheet);
+historyCloseBtn.addEventListener('click', () => closeHistorySheet());
+historyClearBtn.addEventListener('click', () => {
+  saveHistory([]);
+  renderHistoryList();
+});
+// Only the backdrop itself, not a click that bubbled up from the panel or a
+// row inside it.
+historySheet.addEventListener('click', (event) => {
+  if (event.target === historySheet) closeHistorySheet();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !historySheet.hidden) closeHistorySheet();
+});
+window.addEventListener('popstate', () => {
+  if (!historySheet.hidden) closeHistorySheet({ viaPopState: true });
+});
 
 langSwitch.addEventListener('click', (event) => {
   const btn = event.target.closest('.lang-btn');

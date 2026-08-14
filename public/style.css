@@ -87,6 +87,13 @@ body {
   min-width: 0;
 }
 
+/* The first slot holds the history button on the opposite side from
+   "Dịch lại" -- flex-end (the shared default above) would pull it toward the
+   mic instead of out to the edge. */
+.mic-slot:first-child {
+  justify-content: flex-start;
+}
+
 .mic-btn {
   width: 72px;
   height: 72px;
@@ -250,6 +257,26 @@ body {
   transform: scale(0.96);
 }
 
+/* Same visual treatment as .retranslate-btn -- the two sit as a mirrored
+   pair either side of the mic -- kept as its own class since they are
+   unrelated actions. */
+.history-btn {
+  border: 1px solid #4b4e7a;
+  background: #2b2d4d;
+  color: #f2f2f7;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.history-btn:active {
+  transform: scale(0.96);
+}
+
 .speak-btn {
   width: 36px;
   height: 36px;
@@ -300,4 +327,127 @@ body {
   color: #ff7675;
   font-size: 14px;
   margin-top: 16px;
+}
+
+/* --- history sheet ----------------------------------------------------- */
+/* The overlay is its own backdrop (a dimmed fixed layer); .history-panel is
+   the actual sliding card. This is a layer on top of the at-rest screen, not
+   a change to it -- the page's own no-scroll layout above is untouched, and
+   only .history-list inside the panel scrolls. */
+
+.history-sheet {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 20, 0.6);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 10;
+}
+
+/* The [hidden] attribute selector has the same specificity as the bare class
+   rule above and loses to it on source order alone, so display:flex would
+   otherwise win and show the sheet regardless of the hidden attribute --
+   this rule has to out-specify it explicitly. */
+.history-sheet[hidden] {
+  display: none;
+}
+
+.history-panel {
+  width: 100%;
+  max-width: 480px;
+  max-height: min(70vh, 560px);
+  background: #1b1d33;
+  border: 1px solid #33355a;
+  border-bottom: none;
+  border-radius: 20px 20px 0 0;
+  padding: 16px 18px max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* let .history-list shrink and scroll instead of overflowing */
+}
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+}
+
+.history-header h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.history-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-clear-btn {
+  border: none;
+  background: transparent;
+  color: #a0a3c0;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 6px 4px;
+}
+
+.history-close-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: #2b2d4d;
+  color: #f2f2f7;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.history-row {
+  width: 100%;
+  text-align: left;
+  background: #22243c;
+  border: 1px solid #33355a;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.history-row:active {
+  transform: scale(0.99);
+}
+
+.history-row-source {
+  font-size: 15px;
+  word-break: break-word;
+}
+
+.history-row-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #a0a3c0;
+}
+
+.history-empty {
+  text-align: center;
+  color: #6b6e8f;
+  font-style: italic;
+  font-size: 14px;
+  margin: 24px 0;
 }

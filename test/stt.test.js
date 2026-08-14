@@ -18,11 +18,11 @@ const APP_JS = path.join(__dirname, '..', 'public', 'app.js');
 function el(id, { classes = [], dataset = {}, children = [] } = {}) {
   const listeners = {};
   const classSet = new Set(classes);
+  let text = '';
   const node = {
     id,
     dataset,
     children,
-    textContent: '',
     value: '',
     placeholder: '',
     disabled: false,
@@ -43,7 +43,16 @@ function el(id, { classes = [], dataset = {}, children = [] } = {}) {
       ? children.filter((c) => c.classList.contains('lang-btn'))
       : []),
     closest: (sel) => (sel === '.lang-btn' && classSet.has('lang-btn') ? node : null),
+    // Only the history list builds children dynamically rather than declaring
+    // them up front via the `children` option above.
+    appendChild: (child) => { node.children.push(child); return child; },
   };
+  Object.defineProperty(node, 'textContent', {
+    get: () => text,
+    // renderHistoryList() clears the list by assigning '' before rebuilding
+    // it -- mirror the real DOM's behaviour of that also dropping children.
+    set: (v) => { text = v; if (v === '') node.children.length = 0; },
+  });
   return node;
 }
 
@@ -103,7 +112,10 @@ const DEFAULT_VOICES = [
   { name: 'Linh', voiceURI: 'com.apple.voice.enhanced.vi-VN.Linh', lang: 'vi-VN' },
 ];
 
-function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, ttsStatus = 200, translateFail = null } = {}) {
+function loadApp({
+  voices = DEFAULT_VOICES, audio = null, storedLang = null, ttsStatus = 200,
+  translateFail = null, throwOnStorageWrite = false, storedHistory = null,
+} = {}) {
   const langButtons = ['vi', 'en', 'ja'].map((lang) =>
     el(`lang-${lang}`, { classes: ['lang-btn'], dataset: { lang } }));
 
@@ -121,12 +133,19 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
     targetText1: el('targetText1'),
     speakBtn0: el('speakBtn0'),
     speakBtn1: el('speakBtn1'),
+    historyBtn: el('historyBtn'),
+    historySheet: el('historySheet', { classes: [], dataset: {} }),
+    historyList: el('historyList'),
+    historyEmpty: el('historyEmpty'),
+    historyClearBtn: el('historyClearBtn'),
+    historyCloseBtn: el('historyCloseBtn'),
   };
 
   const fetchCalls = [];
   const spoken = [];
   const stored = new Map();
   if (storedLang) stored.set('duolang.sourceLang', storedLang);
+  if (storedHistory) stored.set('duolang.history', JSON.stringify(storedHistory));
   const state = { recognition: null };
 
   class FakeRecognition {
@@ -143,8 +162,19 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
 
   const translationsByLang = { vi: 'Xin chào', en: 'Hello there', ja: 'こんにちは' };
 
+  const historyState = { pushed: 0 };
   const sandbox = {
-    document: { getElementById: (id) => els[id] || el(id) },
+    // addEventListener is a no-op: the Escape-key handler it registers is not
+    // exercised here, unlike the click-driven paths below, which the el()
+    // stub's own addEventListener/_fire handle.
+    document: {
+      getElementById: (id) => els[id] || el(id),
+      addEventListener() {},
+      // renderHistoryList() builds rows dynamically; el() already provides
+      // everything a created node needs (textContent, appendChild, classList,
+      // addEventListener), so reuse it rather than a second stub shape.
+      createElement: (tag) => el(tag),
+    },
     window: {
       SpeechRecognition: FakeRecognition,
       speechSynthesis: {
@@ -157,7 +187,17 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
     },
     localStorage: {
       getItem: (k) => (stored.has(k) ? stored.get(k) : null),
-      setItem: (k, v) => stored.set(k, v),
+      setItem: (k, v) => {
+        if (throwOnStorageWrite) throw new Error('QuotaExceededError');
+        stored.set(k, v);
+      },
+    },
+    // Real pushState/back would navigate the vm context nowhere in particular;
+    // just count them so a test can assert the sheet opened/closed pushed and
+    // popped a history entry, matching the Android-back-button contract.
+    history: {
+      pushState: () => { historyState.pushed += 1; },
+      back: () => { historyState.pushed = Math.max(0, historyState.pushed - 1); },
     },
     navigator: {},
     SpeechSynthesisUtterance: class { constructor(t) { this.text = t; } },
@@ -216,7 +256,7 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(APP_JS, 'utf8'), sandbox);
 
-  return { els, fetchCalls, spoken, state, stored, langButtons };
+  return { els, fetchCalls, spoken, state, stored, langButtons, historyState };
 }
 
 function result(transcript, isFinal) {
@@ -314,6 +354,118 @@ async function hungRequestTimesOutAndRecovers() {
   check('an error is shown', !els.errorMsg.hidden);
   check('the timeout message is Vietnamese', VIETNAMESE.test(els.errorMsg.textContent),
         `got "${els.errorMsg.textContent}"`);
+}
+
+async function historyRecordsACompletedTranslation() {
+  console.log('\n# a completed translation is recorded in history');
+  const { els, state, stored, historyState } = loadApp();
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  const saved = JSON.parse(stored.get('duolang.history') || '[]');
+  check('one entry recorded', saved.length === 1, `length: ${saved.length}`);
+  check('entry has the source text and language', saved[0] && saved[0].text === 'xin chào bạn' && saved[0].source === 'vi',
+        JSON.stringify(saved[0]));
+  check('entry has both translations', saved[0] && saved[0].tr.en === 'Hello there' && saved[0].tr.ja === 'こんにちは',
+        JSON.stringify(saved[0] && saved[0].tr));
+  check('nothing opened the sheet (no pushState) just from translating', historyState.pushed === 0,
+        historyState.pushed);
+}
+
+async function historyDoesNotDuplicateARepeatInANewSession() {
+  console.log('\n# the same sentence translated again in a new session does not add a duplicate row');
+  // A fresh loadApp() is a fresh session: translationCache starts empty, so
+  // this goes through the real fetch path again rather than the client-cache
+  // early-return in translate() -- exactly the case addHistoryEntry's
+  // dedupe-against-the-newest-entry exists for.
+  const existing = [{ at: 1000, source: 'vi', text: 'xin chào bạn', tr: { en: 'Hello there', ja: 'こんにちは' } }];
+  const { els, state, stored } = loadApp({ storedHistory: existing });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  const saved = JSON.parse(stored.get('duolang.history') || '[]');
+  check('still exactly one entry, not two', saved.length === 1, `length: ${saved.length}`);
+}
+
+async function historyEvictsTheOldestEntryPastFifty() {
+  console.log('\n# the 51st entry evicts the oldest, not a random one');
+  // Newest-first, matching how addHistoryEntry stores them (unshift): index 0
+  // is "câu số 49" (the most recent of the 50 already saved), index 49 is
+  // "câu số 0" (the oldest), which a 51st entry should push out.
+  const existing = [];
+  for (let i = 49; i >= 0; i--) {
+    existing.push({ at: i, source: 'vi', text: `câu số ${i}`, tr: { en: 'e', ja: 'j' } });
+  }
+  const { els, state, stored } = loadApp({ storedHistory: existing });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('câu mới nhất', true));
+  await tick();
+
+  const saved = JSON.parse(stored.get('duolang.history') || '[]');
+  check('list stays capped at 50', saved.length === 50, `length: ${saved.length}`);
+  check('the new entry is newest (first)', saved[0].text === 'câu mới nhất', saved[0].text);
+  check('the oldest entry was evicted', !saved.some((e) => e.text === 'câu số 0'));
+  check('the second-oldest survives', saved.some((e) => e.text === 'câu số 1'));
+}
+
+async function restoringAHistoryEntryNeedsNoNetworkCall() {
+  console.log('\n# tapping a history row from a different source language repaints everything with zero network calls');
+  const existing = [{
+    at: 1000, source: 'en', text: 'Hello world', tr: { vi: 'Xin chào thế giới', ja: 'こんにちは世界' },
+  }];
+  const { els, fetchCalls, historyState } = loadApp({ storedHistory: existing, storedLang: 'vi' });
+
+  check('starts on Vietnamese', els.langSwitch.children[0].classList.contains('active'));
+
+  els.historyBtn._fire('click');
+  check('sheet opened', els.historySheet.hidden === false);
+  check('opening pushed a history state (for the Android back button)', historyState.pushed === 1, historyState.pushed);
+  check('one row rendered', els.historyList.children.length === 1, `rows: ${els.historyList.children.length}`);
+
+  const row = els.historyList.children[0].children[0]; // <li><button class="history-row">
+  row._fire('click');
+
+  check('source switched to English', els.langSwitch.children[1].classList.contains('active'));
+  check('source text restored', els.sourceText.value === 'Hello world', els.sourceText.value);
+  check('first pane filled (Vietnamese)', els.targetText0.textContent === 'Xin chào thế giới', els.targetText0.textContent);
+  check('second pane filled (Japanese)', els.targetText1.textContent === 'こんにちは世界', els.targetText1.textContent);
+  check('both speak buttons enabled', !els.speakBtn0.disabled && !els.speakBtn1.disabled);
+  check('sheet closed after restoring', els.historySheet.hidden === true);
+  check('closing popped the pushed history state', historyState.pushed === 0, historyState.pushed);
+  check('no network call was made to restore it', fetchCalls.length === 0, `calls: ${fetchCalls.length}`);
+}
+
+async function historyClearRemovesEverything() {
+  console.log('\n# "Xoá hết" empties the list and shows the empty state');
+  const existing = [{ at: 1, source: 'vi', text: 'một câu', tr: { en: 'e', ja: 'j' } }];
+  const { els, stored } = loadApp({ storedHistory: existing });
+
+  els.historyBtn._fire('click');
+  check('one row before clearing', els.historyList.children.length === 1);
+
+  els.historyClearBtn._fire('click');
+
+  check('list empties in storage', (stored.get('duolang.history') || '[]') === '[]', stored.get('duolang.history'));
+  check('list re-renders empty', els.historyList.children.length === 0, els.historyList.children.length);
+  check('empty-state message shown', els.historyEmpty.hidden === false);
+}
+
+async function storageWriteFailureDoesNotBreakTranslation() {
+  console.log('\n# localStorage throwing (private mode) does not break the translate flow');
+  const { els, state } = loadApp({ throwOnStorageWrite: true });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  check('translation still completed despite storage failing',
+        els.targetText0.textContent === 'Hello there', els.targetText0.textContent);
+  check('no error shown to the user over a storage-only failure', els.errorMsg.hidden);
 }
 
 async function switchingSourceLanguage() {
@@ -544,6 +696,12 @@ async function withoutWebAudioUsesDeviceVoice() {
   await ttsCachesPerSentence();
   await quotaExhaustedFallsBack();
   await withoutWebAudioUsesDeviceVoice();
+  await historyRecordsACompletedTranslation();
+  await historyDoesNotDuplicateARepeatInANewSession();
+  await historyEvictsTheOldestEntryPastFifty();
+  await restoringAHistoryEntryNeedsNoNetworkCall();
+  await historyClearRemovesEverything();
+  await storageWriteFailureDoesNotBreakTranslation();
 
   finish();
 })();
