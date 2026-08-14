@@ -31,6 +31,9 @@ const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
 // prebuilt voices; the model infers the language from the text itself.
 const TTS_VOICES = { vi: 'Puck', en: 'Kore', ja: 'Aoede' };
 const TTS_MAX_CHARS = 600;
+// Generous headroom over a spoken sentence, not a hard product limit -- this
+// exists so one request can't build an arbitrarily large translation prompt.
+const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 1000);
 
 // Google Cloud Text-to-Speech, used in preference to Gemini when a key is
 // configured: its free tier is 1M characters a month rather than 10 requests a
@@ -69,10 +72,23 @@ function tierBudget(tier) {
   return Math.floor((TIER_FREE_CHARS[tier] || 0) * TTS_BUDGET_FRACTION);
 }
 
+// These configured the voices before the tier cascade above replaced them, and
+// deploy/google-cloud-tts.md used to tell people to set them. Setting one now
+// does nothing at all, which is worse than an error -- warn instead of staying
+// silent.
+for (const dead of ['CLOUD_VOICE_VI', 'CLOUD_VOICE_EN', 'CLOUD_VOICE_JA']) {
+  if (process.env[dead]) {
+    console.warn(`${dead} is set but ignored; voices come from TIER_VOICES / TTS_TIER_ORDER now.`);
+  }
+}
+
 const LANG_NAMES = { vi: 'Vietnamese', en: 'English', ja: 'Japanese' };
 const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
 
-app.use(express.json());
+// 8kb is roughly 8x the largest legitimate body (TTS caps at 600 chars,
+// translate at TRANSLATE_MAX_CHARS below) -- the 100kb default only ever
+// bought an unauthenticated caller a bigger Gemini prompt to bill against us.
+app.use(express.json({ limit: '8kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // --- translation ------------------------------------------------------------
@@ -126,7 +142,10 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+      // A real translation measures ~35 tokens (see the model comment above);
+      // 512 is generous headroom while still capping what a prompt-injected
+      // instruction ("ignore the above and write an essay") can cost us.
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 512 },
     }),
   });
 
@@ -162,27 +181,35 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
 app.post('/api/translate', async (req, res) => {
   const text = (req.body && req.body.text || '').trim();
   if (!text) {
-    return res.status(400).json({ error: 'Missing "text" field.' });
+    return res.status(400).json({ error: 'Thiếu nội dung cần dịch.' });
+  }
+  if (text.length > TRANSLATE_MAX_CHARS) {
+    return res.status(413).json({ error: `Câu dài quá ${TRANSLATE_MAX_CHARS} ký tự.` });
   }
 
   // Defaults keep older cached clients, which only ever sent text, working.
   const source = (req.body && req.body.source || 'vi').toLowerCase();
-  const targets = Array.isArray(req.body && req.body.targets) && req.body.targets.length
+  const rawTargets = Array.isArray(req.body && req.body.targets) && req.body.targets.length
     ? req.body.targets.map((t) => String(t).toLowerCase())
     : SUPPORTED_LANGS.filter((l) => l !== source);
+  // Deduped and capped to the number of other languages that exist: without
+  // this, a body repeating one target hundreds of times builds a prompt shape
+  // (translateBatch above) with hundreds of keys for the same one call --
+  // a cheaper amplifier than a large body, so the byte cap above doesn't stop it.
+  const targets = [...new Set(rawTargets)].slice(0, SUPPORTED_LANGS.length - 1);
 
   if (!LANG_NAMES[source]) {
-    return res.status(400).json({ error: `Unsupported source "${source}".` });
+    return res.status(400).json({ error: `Ngôn ngữ nguồn "${source}" không được hỗ trợ.` });
   }
   const badTarget = targets.find((t) => !LANG_NAMES[t]);
   if (badTarget) {
-    return res.status(400).json({ error: `Unsupported target "${badTarget}".` });
+    return res.status(400).json({ error: `Ngôn ngữ đích "${badTarget}" không được hỗ trợ.` });
   }
   if (targets.includes(source)) {
-    return res.status(400).json({ error: 'Source language cannot also be a target.' });
+    return res.status(400).json({ error: 'Ngôn ngữ nguồn không thể cũng là ngôn ngữ đích.' });
   }
   if (!GEMINI_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
+    return res.status(500).json({ error: 'Server thiếu cấu hình GEMINI_API_KEY.' });
   }
 
   try {
@@ -196,7 +223,8 @@ app.post('/api/translate', async (req, res) => {
     res.status(err.status === 429 ? 429 : 502).json({
       error: err.status === 429
         ? 'Hết hạn mức dịch, thử lại sau một lát.'
-        : 'Translation service error.',
+        : 'Lỗi dịch vụ dịch thuật.',
+      detail: err.message,
     });
   }
 });
@@ -400,18 +428,18 @@ app.post('/api/tts', async (req, res) => {
   const lang = (req.body && req.body.lang || '').trim().toLowerCase();
 
   if (!text) {
-    return res.status(400).json({ error: 'Missing "text" field.' });
+    return res.status(400).json({ error: 'Thiếu nội dung cần đọc.' });
   }
   if (text.length > TTS_MAX_CHARS) {
-    return res.status(413).json({ error: `Text longer than ${TTS_MAX_CHARS} characters.` });
+    return res.status(413).json({ error: `Câu dài quá ${TTS_MAX_CHARS} ký tự.` });
   }
   if (!TTS_VOICES[lang]) {
-    return res.status(400).json({ error: `Unsupported lang "${lang}". Use one of: ${Object.keys(TTS_VOICES).join(', ')}.` });
+    return res.status(400).json({ error: `Ngôn ngữ "${lang}" không được hỗ trợ. Dùng một trong: ${Object.keys(TTS_VOICES).join(', ')}.` });
   }
 
   const useCloud = Boolean(CLOUD_TTS_API_KEY);
   if (!useCloud && !GEMINI_API_KEY) {
-    return res.status(500).json({ error: 'Server has no speech credentials configured.' });
+    return res.status(500).json({ error: 'Server chưa cấu hình khoá giọng đọc.' });
   }
 
   const cacheKey = `${lang}|${text}`;
@@ -440,7 +468,7 @@ app.post('/api/tts', async (req, res) => {
       if (err.status === 429) {
         return res.status(429).json({ error: 'Hết hạn mức giọng đọc hôm nay, tạm dùng giọng máy.' });
       }
-      return res.status(502).json({ error: 'Speech service error.' });
+      return res.status(502).json({ error: 'Lỗi dịch vụ giọng đọc.', detail: err.message });
     }
   }
 
@@ -465,7 +493,7 @@ app.post('/api/tts', async (req, res) => {
         continue;
       }
       console.error(`Cloud TTS failed on ${tier}:`, err.message, err.body || '');
-      return res.status(502).json({ error: 'Speech service error.' });
+      return res.status(502).json({ error: 'Lỗi dịch vụ giọng đọc.', detail: err.message });
     }
   }
 
@@ -500,6 +528,20 @@ app.get('/api/tts/usage', (req, res) => {
     totalRemaining: tiers.reduce((sum, t) => sum + t.remaining, 0),
     overallLimit: TTS_MONTHLY_CHAR_LIMIT || null,
     tiers,
+  });
+});
+
+// body-parser signals an oversized or malformed body by throwing, and express's
+// default handler answers those with an HTML error page. The client reads
+// res.json() before it checks res.ok, so that HTML surfaces as an English
+// "Unexpected token '<'" SyntaxError on an otherwise all-Vietnamese screen.
+// Registered last (4-arg signature) so it only catches what routes didn't.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const tooBig = err.type === 'entity.too.large';
+  res.status(tooBig ? 413 : 400).json({
+    error: tooBig ? 'Câu quá dài.' : 'Yêu cầu không hợp lệ.',
+    detail: err.type || err.message,
   });
 });
 
