@@ -80,7 +80,13 @@ function clearTranslations() {
   translations = {};
   lastTranslatedText = '';
   targetPanes.forEach((pane) => {
+    // Silence the live region for the placeholder write: aria-live is meant
+    // to announce a translation landing, and this runs on every mic tap and
+    // every language switch -- without turning it off first, a screen reader
+    // would read the placeholder text out loud each time too.
+    pane.text.setAttribute('aria-live', 'off');
     setText(pane.text, LANGS[pane.lang].targetPlaceholder, true);
+    pane.text.setAttribute('aria-live', 'polite');
     pane.speak.disabled = true;
   });
 }
@@ -102,8 +108,12 @@ function applySourceLang(lang, { keepText = false } = {}) {
     pane.lang = targetLangs[i];
     pane.label.textContent = LANGS[pane.lang].label;
     pane.speak.setAttribute('aria-label', `Nghe ${LANGS[pane.lang].label}`);
+    // Without this a screen reader reads every language in whatever voice its
+    // own UI is set to -- Japanese narrated in an English voice, for example.
+    pane.text.lang = LANGS[pane.lang].bcp47;
   });
 
+  sourceInput.lang = LANGS[lang].bcp47;
   sourceInput.placeholder = LANGS[lang].sourcePlaceholder;
   subtitle.textContent = `Nói ${LANGS[lang].label.replace(/^\S+\s/, '')} → dịch cùng lúc sang 2 ngôn ngữ còn lại`;
   micStatus.textContent = idlePrompt();
@@ -461,6 +471,7 @@ if (!SpeechRecognitionImpl) {
     translationStarted = false;
     sessionFailed = false;
     micBtn.classList.add('recording');
+    micBtn.setAttribute('aria-pressed', 'true');
     micStatus.textContent = 'Đang nghe...';
     clearError();
   });
@@ -468,6 +479,7 @@ if (!SpeechRecognitionImpl) {
   recognition.addEventListener('end', () => {
     isRecording = false;
     micBtn.classList.remove('recording');
+    micBtn.setAttribute('aria-pressed', 'false');
     if (!translationStarted && lastTranscript) {
       translationStarted = true;
       translate(lastTranscript);
@@ -480,6 +492,7 @@ if (!SpeechRecognitionImpl) {
     isRecording = false;
     sessionFailed = true;
     micBtn.classList.remove('recording');
+    micBtn.setAttribute('aria-pressed', 'false');
     if (event.error === 'no-speech') {
       micStatus.textContent = 'Không nghe thấy gì, thử lại nhé.';
     } else if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {

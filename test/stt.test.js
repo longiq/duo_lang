@@ -334,6 +334,11 @@ async function switchingSourceLanguage() {
         els.targetLabel0.textContent.includes('Tiếng Việt') && els.targetLabel1.textContent.includes('English'),
         `${els.targetLabel0.textContent} / ${els.targetLabel1.textContent}`);
   check('choice persisted', stored.get('duolang.sourceLang') === 'ja', stored.get('duolang.sourceLang'));
+  // Without a per-pane lang attribute, a screen reader narrates every
+  // language in whatever voice its own UI is set to.
+  check('source textarea lang follows the spoken language', els.sourceText.lang === 'ja-JP', els.sourceText.lang);
+  check('first pane lang matches its (new) language', els.targetText0.lang === 'vi-VN', els.targetText0.lang);
+  check('second pane lang matches its (new) language', els.targetText1.lang === 'en-US', els.targetText1.lang);
 
   els.micBtn._fire('click');
   check('recognition switched language', state.recognition.lang === 'ja-JP', `lang: ${state.recognition.lang}`);
