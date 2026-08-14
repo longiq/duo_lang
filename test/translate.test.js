@@ -2,18 +2,10 @@
 // Gemini endpoint, so no quota is spent and every upstream call is counted.
 //
 // Run with: npm test
-const fs = require('fs');
-const path = require('path');
-const { spawn } = require('child_process');
+const { check, finish, startServer, waitForServer } = require('./helpers');
 
 const PORT = 3288;
 const BASE = `http://127.0.0.1:${PORT}`;
-
-const failures = [];
-function check(name, cond, detail) {
-  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`);
-  if (!cond) failures.push(name);
-}
 
 // Stand-in for generativelanguage.googleapis.com. Records which targets each
 // prompt asked for, which is how we tell a partial cache hit from a full miss.
@@ -57,21 +49,13 @@ const translate = (text, source, targets) => fetch(`${BASE}/api/translate`, {
 
 async function main() {
   const fake = await startFakeGemini();
-  const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      HOST: '127.0.0.1',
-      GEMINI_API_KEY: 'fake-key',
-      GEMINI_ENDPOINT_BASE: `http://127.0.0.1:${fake.port}/v1beta/models`,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  const child = startServer({
+    PORT: String(PORT),
+    HOST: '127.0.0.1',
+    GEMINI_API_KEY: 'fake-key',
+    GEMINI_ENDPOINT_BASE: `http://127.0.0.1:${fake.port}/v1beta/models`,
   });
-  child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
-
-  for (let i = 0; i < 60; i++) {
-    try { await fetch(`${BASE}/`); break; } catch { await new Promise((r) => setTimeout(r, 100)); }
-  }
+  await waitForServer(`${BASE}/`);
 
   try {
     // First time: both languages missing, so one call asking for both.
@@ -123,11 +107,7 @@ async function main() {
     fake.server.close();
   }
 
-  if (failures.length) {
-    console.log(`\n${failures.length} check(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nall checks passed');
+  finish();
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });

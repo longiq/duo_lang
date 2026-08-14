@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { check, finish } = require('./helpers');
 
 const APP_JS = path.join(__dirname, '..', 'public', 'app.js');
 
@@ -195,12 +196,6 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
 
 function result(transcript, isFinal) {
   return { resultIndex: 0, results: [Object.assign([{ transcript }], { isFinal })] };
-}
-
-const failures = [];
-function check(name, cond, detail) {
-  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`);
-  if (!cond) failures.push(name);
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -476,9 +471,5 @@ async function withoutWebAudioUsesDeviceVoice() {
   await quotaExhaustedFallsBack();
   await withoutWebAudioUsesDeviceVoice();
 
-  if (failures.length) {
-    console.log(`\n${failures.length} check(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nall checks passed');
+  finish();
 })();

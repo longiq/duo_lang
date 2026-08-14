@@ -5,21 +5,14 @@
 // the thing actually standing between the app and a bill.
 //
 // Run with: npm test
-const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { check, finish, startServer: spawnServer, waitForServer: pollServer } = require('./helpers');
 
 const PORT = 3287;
 const BASE = `http://127.0.0.1:${PORT}`;
 const usageFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'duolang-')), 'usage.json');
-
-const failures = [];
-function check(name, cond, detail) {
-  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`);
-  if (!cond) failures.push(name);
-}
 
 // A local stand-in for texttospeech.googleapis.com so no real quota is spent.
 // `quotaOut` names tiers it should answer with 429, imitating Google's own
@@ -58,35 +51,19 @@ function startFakeGoogle(quotaOut = new Set()) {
 }
 
 function startServer(fake, extraEnv = {}) {
-  const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      HOST: '127.0.0.1',
-      GEMINI_API_KEY: 'unused-in-this-test',
-      GOOGLE_TTS_API_KEY: 'fake-cloud-key',
-      TTS_USAGE_FILE: usageFile,
-      // Point the Cloud TTS client at the local stand-in.
-      CLOUD_TTS_ENDPOINT: `http://127.0.0.1:${fake.port}/v1/text:synthesize`,
-      ...extraEnv,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  return spawnServer({
+    PORT: String(PORT),
+    HOST: '127.0.0.1',
+    GEMINI_API_KEY: 'unused-in-this-test',
+    GOOGLE_TTS_API_KEY: 'fake-cloud-key',
+    TTS_USAGE_FILE: usageFile,
+    // Point the Cloud TTS client at the local stand-in.
+    CLOUD_TTS_ENDPOINT: `http://127.0.0.1:${fake.port}/v1/text:synthesize`,
+    ...extraEnv,
   });
-  child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
-  return child;
 }
 
-async function waitForServer() {
-  for (let i = 0; i < 60; i++) {
-    try {
-      await fetch(`${BASE}/api/tts/usage`);
-      return;
-    } catch (err) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-  throw new Error('server never came up');
-}
+const waitForServer = () => pollServer(`${BASE}/api/tts/usage`);
 
 const tts = (text) => fetch(`${BASE}/api/tts`, {
   method: 'POST',
@@ -227,11 +204,7 @@ async function main() {
   await googleQuotaCascade();
   await overallCeiling();
 
-  if (failures.length) {
-    console.log(`\n${failures.length} check(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nall checks passed');
+  finish();
 }
 
 main().catch((err) => {

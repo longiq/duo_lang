@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Production runs Node 20 (see deploy/README.md); 24 guards the gap
+        # to whatever a dev machine happens to have.
+        node-version: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      # No API keys needed: every test that talks to "Gemini" or "Google
+      # Cloud TTS" spawns the real server against a local stub, never the
+      # real upstream.
+      - run: npm test
+      # The zero-build frontend has no bundler and no linter, so nothing
+      # else ever parses these files -- this is the only syntax gate they get.
+      - run: node --check public/app.js && node --check public/sw.js && node --check tools/make-icons.js

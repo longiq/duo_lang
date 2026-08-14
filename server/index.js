@@ -545,6 +545,14 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`duo_lang server running on http://${HOST}:${PORT}`);
-});
+// Exported so the byte-level helpers can be unit-tested directly, without a
+// subprocess and a stub upstream. Guarded so that requiring this file (as the
+// unit tests do) does not also bind a port; both existing integration tests
+// already spawn this file as a subprocess, where require.main === module.
+module.exports = { pcmToWav, parseAudioMime, lruGet, lruSet, currentPeriod, readUsage, app };
+
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`duo_lang server running on http://${HOST}:${PORT}`);
+  });
+}
