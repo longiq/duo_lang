@@ -39,6 +39,9 @@ const GEMINI_TTS_MODELS = (process.env.GEMINI_TTS_MODELS ||
 // prebuilt voices; the model infers the language from the text itself.
 const TTS_VOICES = { vi: 'Puck', en: 'Kore', ja: 'Aoede' };
 const TTS_MAX_CHARS = 600;
+// Node's fetch has no default timeout: a hung upstream would otherwise pin a
+// request (and, now that there's a rate limiter, a bucket slot) forever.
+const UPSTREAM_TIMEOUT_MS = 15000;
 // Generous headroom over a spoken sentence, not a hard product limit -- this
 // exists so one request can't build an arbitrarily large translation prompt.
 const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 1000);
@@ -299,6 +302,7 @@ ${LANG_NAMES[source]} sentence: "${text}"`;
       // instruction ("ignore the above and write an essay") can cost us.
       generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 512 },
     }),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -537,6 +541,7 @@ async function synthesiseWithCloudTts(text, lang, tier) {
       // repackaging before decodeAudioData.
       audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 24000 },
     }),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -576,6 +581,7 @@ async function synthesiseWithGemini(text, lang) {
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
         },
       }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
 
     if (response.ok) {

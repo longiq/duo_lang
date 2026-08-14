@@ -103,7 +103,7 @@ const DEFAULT_VOICES = [
   { name: 'Linh', voiceURI: 'com.apple.voice.enhanced.vi-VN.Linh', lang: 'vi-VN' },
 ];
 
-function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, ttsStatus = 200 } = {}) {
+function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, ttsStatus = 200, translateFail = null } = {}) {
   const langButtons = ['vi', 'en', 'ja'].map((lang) =>
     el(`lang-${lang}`, { classes: ['lang-btn'], dataset: { lang } }));
 
@@ -161,9 +161,34 @@ function loadApp({ voices = DEFAULT_VOICES, audio = null, storedLang = null, tts
     },
     navigator: {},
     SpeechSynthesisUtterance: class { constructor(t) { this.text = t; } },
+    // app.js's fetchWithTimeout() needs these; a vm context is an isolated
+    // global object and does not inherit the outer Node process's own.
+    // setTimeout is capped short: the only thing app.js uses it for is the
+    // fetchWithTimeout abort timer, so translateFail: 'hang' below can prove
+    // the real abort path fires without the test waiting out the real 12s.
+    setTimeout: (fn, ms) => setTimeout(fn, Math.min(ms, 50)),
+    clearTimeout,
+    AbortController,
     fetch: (url, opts) => {
       const body = opts && opts.body ? JSON.parse(opts.body) : {};
       fetchCalls.push({ url, body });
+      if (url === '/api/translate' && translateFail === 'reject') {
+        return Promise.reject(new TypeError('Failed to fetch'));
+      }
+      if (url === '/api/translate' && translateFail === 'hang') {
+        // Never resolves on its own -- only the real AbortSignal, fired by
+        // fetchWithTimeout's timer above, ever settles this promise, the same
+        // way a genuinely hung fetch() only ever settles via its signal.
+        return new Promise((resolve, reject) => {
+          if (opts && opts.signal) {
+            opts.signal.addEventListener('abort', () => {
+              const err = new Error('The user aborted a request.');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          }
+        });
+      }
       if (url === '/api/tts') {
         if (ttsStatus !== 200) {
           return Promise.resolve({
@@ -247,6 +272,48 @@ async function noSpeechKeepsItsMessage() {
   check('nothing translated', fetchCalls.filter((c) => c.url === '/api/translate').length === 0);
   check('error message preserved', els.micStatus.textContent === 'Không nghe thấy gì, thử lại nhé.',
         `got "${els.micStatus.textContent}"`);
+}
+
+// The browser's own fetch rejection message is English ("Failed to fetch"),
+// which has no business reaching a screen that's otherwise all Vietnamese --
+// this is the regression app.js's networkMessage() exists to prevent.
+const VIETNAMESE = /[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]/i;
+
+async function networkFailureShowsVietnameseMessage() {
+  console.log('\n# a rejected fetch (offline, DNS failure, ...) shows a Vietnamese message, not "Failed to fetch"');
+  const { els, state } = loadApp({ translateFail: 'reject' });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  await tick();
+
+  check('an error is shown', !els.errorMsg.hidden);
+  check('it is Vietnamese, not the raw browser message', VIETNAMESE.test(els.errorMsg.textContent),
+        `got "${els.errorMsg.textContent}"`);
+  check('the raw "Failed to fetch" string never reached the screen',
+        !/Failed to fetch/i.test(els.errorMsg.textContent), `got "${els.errorMsg.textContent}"`);
+  check('status line recovered rather than staying stuck', els.micStatus.textContent === 'Bấm micro và nói tiếng Việt',
+        `got "${els.micStatus.textContent}"`);
+}
+
+async function hungRequestTimesOutAndRecovers() {
+  console.log('\n# a translate call that never answers times out instead of leaving "Đang dịch..." forever');
+  const { els, state } = loadApp({ translateFail: 'hang' });
+
+  els.micBtn._fire('click');
+  state.recognition.fire('result', result('xin chào bạn', true));
+  // The sandbox's setTimeout above is capped at 50ms, so the real abort
+  // timer inside fetchWithTimeout fires almost immediately; a couple of
+  // ticks is enough for the abort -> catch -> showError chain to settle.
+  await tick();
+  await tick();
+  await tick();
+
+  check('status line is not stuck on "Đang dịch..."', els.micStatus.textContent !== 'Đang dịch...',
+        `got "${els.micStatus.textContent}"`);
+  check('an error is shown', !els.errorMsg.hidden);
+  check('the timeout message is Vietnamese', VIETNAMESE.test(els.errorMsg.textContent),
+        `got "${els.errorMsg.textContent}"`);
 }
 
 async function switchingSourceLanguage() {
@@ -461,6 +528,8 @@ async function withoutWebAudioUsesDeviceVoice() {
 (async () => {
   await endsWithoutFinalResult();
   await noSpeechKeepsItsMessage();
+  await networkFailureShowsVietnameseMessage();
+  await hungRequestTimesOutAndRecovers();
   await switchingSourceLanguage();
   await restoresStoredSourceLanguage();
   await editingSourceText();

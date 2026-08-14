@@ -24,6 +24,11 @@ const LANGS = {
 // Fixed order so the two target panes never swap position unexpectedly.
 const LANG_ORDER = ['vi', 'en', 'ja'];
 const SOURCE_STORAGE_KEY = 'duolang.sourceLang';
+// flash-lite answers in about a second (see server/index.js's model comment);
+// 12s is 12x headroom before giving up rather than leaving "Đang dịch..." on
+// screen for as long as the page stays open.
+const TRANSLATE_TIMEOUT_MS = 12000;
+const TTS_TIMEOUT_MS = 15000;
 
 const micBtn = document.getElementById('micBtn');
 const micStatus = document.getElementById('micStatus');
@@ -125,6 +130,28 @@ function showTranslations(result) {
   });
 }
 
+// Nothing in the browser times a fetch out on its own: a Gemini call that
+// never answers would otherwise leave "Đang dịch..." on screen for as long as
+// the page stays open. AbortController rather than AbortSignal.timeout, which
+// iOS only gained in 16.
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// A fetch rejection's message is the browser's own, in English ("Failed to
+// fetch", "The user aborted a request") -- it has no business reaching a
+// screen that's otherwise entirely Vietnamese. Nothing the network layer says
+// is ever shown directly; only these mapped messages are.
+function networkMessage(err) {
+  if (err && err.name === 'AbortError') return 'Mạng chậm quá, thử lại nhé.';
+  // onLine is only trustworthy in the false direction: true does not mean
+  // there is actually a working connection, just that the OS thinks so.
+  if (navigator.onLine === false) return 'Đang ngoại tuyến, cần mạng để dịch.';
+  return 'Không kết nối được máy chủ, thử lại nhé.';
+}
+
 async function translate(text) {
   clearError();
 
@@ -145,14 +172,20 @@ async function translate(text) {
 
   micStatus.textContent = 'Đang dịch...';
   try {
-    const res = await fetch('/api/translate', {
+    const res = await fetchWithTimeout('/api/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, source: sourceLang, targets: targetLangs }),
-    });
-    const data = await res.json();
+    }, TRANSLATE_TIMEOUT_MS);
+    // A response that isn't JSON at all (nginx's own error page, a captive
+    // portal) would otherwise throw a SyntaxError with an English message
+    // straight past the catch below's network-specific handling.
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(data.error || 'Lỗi dịch thuật.');
+      // The server's error strings are already Vietnamese (server/index.js) --
+      // shown as-is, unlike the network failures caught below.
+      showError(data.error || 'Lỗi dịch thuật.');
+      return;
     }
 
     const result = data.translations || data;
@@ -161,11 +194,12 @@ async function translate(text) {
     });
     showTranslations(result);
     lastTranslatedText = text;
-    micStatus.textContent = idlePrompt();
   } catch (err) {
-    showError(err.message || 'Không thể dịch câu này.');
-    micStatus.textContent = idlePrompt();
+    // Only reached for an actual network/timeout failure -- a non-2xx
+    // response took the branch above instead of throwing.
+    showError(networkMessage(err));
   } finally {
+    micStatus.textContent = idlePrompt();
     refreshRetranslateState();
   }
 }
@@ -260,7 +294,26 @@ function speakWithDeviceVoice(text, bcp47) {
 
 let audioCtx = null;
 let currentSource = null;
+// Decoded AudioBuffers, not strings: a 5s 24kHz mono clip is Float32 PCM at
+// roughly 480KB, so an unbounded cache here (unlike translationCache above,
+// which is harmless strings) could hold tens of MB of heap in a mobile PWA
+// after a long session or a lot of history replays. Capped the same way the
+// server caches are, LRU by most-recently-played.
 const audioCache = new Map();
+const AUDIO_CACHE_MAX = 20;
+
+function audioCacheGet(key) {
+  if (!audioCache.has(key)) return null;
+  const value = audioCache.get(key);
+  audioCache.delete(key);
+  audioCache.set(key, value); // reinsert to mark it recent
+  return value;
+}
+
+function audioCacheSet(key, value) {
+  audioCache.set(key, value);
+  while (audioCache.size > AUDIO_CACHE_MAX) audioCache.delete(audioCache.keys().next().value);
+}
 
 // Must be called synchronously from the click handler: iOS only allows a
 // context to start or resume inside a user gesture.
@@ -334,14 +387,14 @@ function playBuffer(ctx, buffer) {
 
 async function speakViaServer(ctx, text, lang) {
   const key = `${lang}|${text}`;
-  let buffer = audioCache.get(key);
+  let buffer = audioCacheGet(key);
 
   if (!buffer) {
-    const res = await fetch('/api/tts', {
+    const res = await fetchWithTimeout('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, lang }),
-    });
+    }, TTS_TIMEOUT_MS);
     if (!res.ok) {
       const err = new Error('speech request failed');
       // Distinguish the budget cap so the user is told why it sounds different.
@@ -352,7 +405,7 @@ async function speakViaServer(ctx, text, lang) {
       throw err;
     }
     buffer = await decodeAudio(ctx, await res.arrayBuffer());
-    audioCache.set(key, buffer);
+    audioCacheSet(key, buffer);
   }
 
   playBuffer(ctx, buffer);
